@@ -6,12 +6,14 @@ import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import kotlinx.coroutines.flow.MutableStateFlow
+import org.json.JSONArray
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
 import org.vosk.android.RecognitionListener
 import org.vosk.android.SpeechService
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
@@ -112,6 +114,14 @@ object WakeWord {
         "hey our ellis", "hey oralis", "hey a really's", "hey really is", "hey arealis",
         "hey aurelio", "hey or alice", "hey aurelis", "okay aurelius", "hi aurelius", "hey ralis"
     )
+    private val HELLO = Regex("\\bhello\\b")
+
+    /** Words the standby recogniser is limited to, which makes wake-word detection far more reliable. */
+    fun grammar(prefs: Prefs): String {
+        val words = (DEFAULTS.joinToString(" ") + " " + prefs.wakeExtra + " hello hi okay our a")
+            .lowercase(Locale.ROOT).split(Regex("[^a-z']+")).filter { it.isNotBlank() }.distinct()
+        return JSONArray(words + "[unk]").toString()
+    }
     private val GREETINGS = setOf("hey", "hay", "hi", "okay", "ok", "hello")
 
     fun variants(prefs: Prefs): List<String> =
@@ -125,6 +135,9 @@ object WakeWord {
     fun detect(text: String, variants: List<String>): Boolean {
         val t = norm(text)
         if (t.isEmpty()) return false
+        // A plain "hello" also wakes AURELIS, but only from standby: while it is speaking, its own
+        // voice could say "hello" and interrupt itself.
+        if (AppState.core.value == CoreState.STANDBY && HELLO.containsMatchIn(t)) return true
         if (variants.any { v -> norm(v).let { it.isNotEmpty() && t.contains(it) } }) return true
         // Fuzzy: a greeting followed by 1-3 words that together sound like "aurelis".
         val words = t.split(" ")
@@ -160,11 +173,12 @@ object WakeWord {
     }
 }
 
-/** Plain HTTPS file downloader with progress. */
+/** HTTPS file downloader with progress. Interrupted downloads resume instead of starting again. */
 object Downloader {
     fun download(url: String, dest: File, progress: (Int) -> Unit) {
         dest.parentFile?.mkdirs()
         val tmp = File(dest.path + ".part")
+        val have = if (tmp.exists()) tmp.length() else 0L
         var current = url
         var conn: HttpURLConnection? = null
         // Follow redirects manually (Hugging Face redirects to its CDN).
@@ -174,6 +188,7 @@ object Downloader {
             c.connectTimeout = 20_000
             c.readTimeout = 60_000
             c.setRequestProperty("User-Agent", "AURELIS-Android")
+            if (have > 0) c.setRequestProperty("Range", "bytes=$have-")
             val code = c.responseCode
             if (code in 300..399) {
                 val loc = c.getHeaderField("Location") ?: throw IOException("Redirect without location")
@@ -181,16 +196,22 @@ object Downloader {
                 c.disconnect()
                 continue
             }
+            if (code == 416) {
+                tmp.delete()
+                throw IOException("Download had to restart. Please try again.")
+            }
             if (code !in 200..299) throw IOException("Download failed (HTTP $code)")
             conn = c
             break
         }
         val c = conn ?: throw IOException("Too many redirects")
-        val total = c.contentLengthLong
-        var done = 0L
+        val resumed = c.responseCode == 206
+        val length = c.contentLengthLong
+        val total = if (length > 0) length + (if (resumed) have else 0L) else -1L
+        var done = if (resumed) have else 0L
         var lastPct = -1
         c.inputStream.use { input ->
-            tmp.outputStream().use { out ->
+            FileOutputStream(tmp, resumed).use { out ->
                 val buf = ByteArray(64 * 1024)
                 while (true) {
                     val n = input.read(buf)
@@ -285,7 +306,17 @@ object Ears {
         stop()
         val m = model ?: return false
         return try {
-            val rec = Recognizer(m, 16000.0f)
+            // In standby, limit the recogniser to the wake words: far fewer misses than open dictation.
+            val wakeOnly = AppState.core.value == CoreState.STANDBY
+            val rec = if (wakeOnly) {
+                try {
+                    Recognizer(m, 16000.0f, WakeWord.grammar(Prefs(AurelisApp.instance)))
+                } catch (e: Throwable) {
+                    Recognizer(m, 16000.0f)
+                }
+            } else {
+                Recognizer(m, 16000.0f)
+            }
             val s = SpeechService(rec, 16000.0f)
             s.startListening(object : RecognitionListener {
                 override fun onPartialResult(hypothesis: String?) {
