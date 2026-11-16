@@ -40,6 +40,9 @@ class AurelisService : Service() {
         const val ACTION_HUSH = "com.aurelis.app.HUSH"
         const val GREETING = "AURELIS online. How may I assist you?"
         private const val NOTIF_ID = 11
+        private val WAKE_PREFIX = Regex(
+            "^\\s*(?:hey|hi|okay|ok|hello)\\s+(?:aur\\w*|oralis|arealis|ralis|(?:or|are|our)\\s+(?:ellis|alice)|a\\s+really's|really\\s+is)\\s+"
+        )
 
         @Volatile
         var running = false
@@ -205,22 +208,39 @@ class AurelisService : Service() {
         AppState.core.value = CoreState.STANDBY
         AppState.wakeActive.value = true
         AppState.status.value = ""
-        updateNotification("Standby · say \"Hey AURELIS\"")
+        // Open listening: answer whatever is said. Otherwise wait for "Hey AURELIS", "hello" or a double clap.
+        val open = Opt.openListening(this)
+        updateNotification(if (open) "Listening · just speak to me" else "Standby · say \"Hey AURELIS\" or clap twice")
         val variants = WakeWord.variants(prefs)
+        val onClap: (() -> Unit)? = if (Opt.clap(this)) ({ if (phase == Phase.STANDBY) onWake() }) else null
         val started = Ears.start(
             onPartial = { t ->
                 AppState.heard.value = t
-                if (phase == Phase.STANDBY && WakeWord.detect(t, variants)) onWake()
+                if (!open && phase == Phase.STANDBY && WakeWord.detect(t, variants)) onWake()
             },
             onFinal = { t ->
                 if (t.isNotEmpty()) AppState.heard.value = t
-                if (phase == Phase.STANDBY && WakeWord.detect(t, variants)) onWake()
+                if (phase == Phase.STANDBY) {
+                    val words = WakeWord.norm(t).split(" ").count { it.isNotEmpty() }
+                    if (WakeWord.detect(t, variants) && (!open || words <= 3)) {
+                        onWake()
+                    } else if (open && Speech.meaningful(t)) {
+                        Ears.stop()
+                        AppState.wakeActive.value = false
+                        // Drop a leading "Hey AURELIS" so the command itself is what gets understood.
+                        process(
+                            if (WakeWord.detect(t, variants)) t.replaceFirst(WAKE_PREFIX, "") else t
+                        )
+                    }
+                }
             },
             onFail = { msg ->
                 AppState.status.value = "Microphone: $msg"
                 Ears.stop()
                 handler.postDelayed({ if (phase == Phase.STANDBY) enterStandby() }, 3000)
-            }
+            },
+            onClap = onClap,
+            grammar = if (open) null else WakeWord.grammar(prefs)
         )
         if (!started) {
             AppState.core.value = CoreState.ERROR
@@ -376,7 +396,8 @@ class AurelisService : Service() {
                 }
             },
             onFinal = {},
-            onFail = { Ears.stop() }
+            onFail = { Ears.stop() },
+            grammar = WakeWord.grammar(prefs)
         )
     }
 
