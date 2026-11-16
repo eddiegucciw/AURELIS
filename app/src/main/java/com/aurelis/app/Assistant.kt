@@ -396,7 +396,7 @@ object Assistant {
     fun mode(ctx: Context): BrainMode {
         val hasKey = SecureStore.get(ctx, "cloud_key").isNotBlank()
         return when {
-            AppState.online.value && hasKey && !Opt2.forceOffline(ctx) -> BrainMode.ONLINE
+            AppState.online.value && hasKey && !Opt2.forceOffline(ctx) && !CloudGate.blocked() -> BrainMode.ONLINE
             LocalBrain.active(ctx) != null -> BrainMode.OFFLINE
             else -> BrainMode.LIMITED
         }
@@ -545,7 +545,7 @@ object Assistant {
         }
 
         // Commands we can understand locally and reliably.
-        (Actions.handle(ctx, cleaned) ?: MoreSkills.handle(ctx, cleaned) ?: Skills.handle(ctx, cleaned))?.let {
+        (VoiceModes.handle(ctx, cleaned) ?: Actions.handle(ctx, cleaned) ?: MoreSkills.handle(ctx, cleaned) ?: Skills.handle(ctx, cleaned))?.let {
             lastCommand = cleaned
             return it
         }
@@ -561,24 +561,38 @@ object Assistant {
                 val key = SecureStore.get(ctx, "cloud_key")
                 try {
                     val out = CloudBrain.ask(key, AurelisApp.instance.prefs.cloudModel, onlinePrompt(ctx, text), history, text)
+                    CloudGate.reset()
                     fromCloud(ctx, out)
                 } catch (e: CloudBrain.CloudError) {
+                    // Unreachable: stop retrying the cloud for a while instead of timing out on every request.
+                    if (e.isNetwork) CloudGate.failed()
                     // Fall back to the local brain rather than failing outright.
                     val local = if (LocalBrain.active(ctx) != null) LocalBrain.generate(ctx, offlinePrompt(ctx, text), history, text) else null
-                    if (local != null) Reply("${e.userMessage} Using my offline brain instead: $local")
-                    else Reply(e.userMessage)
+                    when {
+                        local != null -> Reply("${e.userMessage} Using my offline brain instead: ${speakable(local)}")
+                        Knowledge.search(ctx, text, 1).isNotEmpty() -> Reply("${e.userMessage} ${Knowledge.answer(ctx, text)}")
+                        else -> Reply(e.userMessage)
+                    }
                 }
             }
             BrainMode.OFFLINE -> {
                 val out = LocalBrain.generate(ctx, offlinePrompt(ctx, text), history, text)
-                Reply(out?.ifBlank { null } ?: "My offline brain couldn't produce an answer. It may need more free memory.")
+                if (out.isNullOrBlank()) {
+                    if (Knowledge.search(ctx, text, 1).isNotEmpty()) Reply(Knowledge.answer(ctx, text))
+                    else Reply("My offline brain couldn't produce an answer. It may need more free memory.")
+                } else {
+                    fromLocal(ctx, text, out)
+                }
             }
-            BrainMode.LIMITED -> Reply(
-                if (!AppState.online.value)
-                    "I'm in limited mode: there's no internet and no offline brain installed. I can still handle reminders, tasks, memories, time, battery and the torch. You can download an offline brain in Settings."
-                else
-                    "I'm in limited mode because no cloud API key is set. Add your Gemini key in Settings, or download an offline brain."
-            )
+            BrainMode.LIMITED -> {
+                if (Knowledge.search(ctx, text, 1).isNotEmpty()) return Reply(Knowledge.answer(ctx, text))
+                Reply(
+                    if (!AppState.online.value || CloudGate.blocked())
+                        "I'm in limited mode: there's no internet and no offline brain installed, and that isn't in my offline library. I can still handle reminders, tasks, memories, time, battery and the torch. You can download an offline brain in Settings."
+                    else
+                        "I'm in limited mode because no cloud API key is set. Add your Gemini key in Settings, or download an offline brain."
+                )
+            }
         }
     }
 
@@ -587,6 +601,29 @@ object Assistant {
             "i (can't|cannot|am unable to|am not able to) (change|adjust|control|access|modify) (your|the) (phone|device|display|screen|settings|brightness|volume)",
         RegexOption.IGNORE_CASE
     )
+
+    private val QUESTION = Regex(
+        "^(what|who|whom|whose|why|how|when|where|which|is|are|was|were|do|does|did|can you tell|tell me about|explain|define|describe)\\b",
+        RegexOption.IGNORE_CASE
+    )
+
+    /** Strips any JSON the offline model produced, leaving words that can be spoken. */
+    private fun speakable(out: String): String {
+        val obj = Intents.parseJsonAction(out) ?: return out
+        return obj.optString("say").trim().ifEmpty { "I'm not sure." }
+    }
+
+    /**
+     * The offline brain (Qwen) may answer with words, or with the same JSON actions the cloud uses
+     * when the user asked for something the rule-based commands didn't recognise. Actions run only
+     * when the user was asking to do something (not asking a question), and sensitive ones still
+     * need a spoken yes.
+     */
+    private suspend fun fromLocal(ctx: Context, text: String, out: String): Reply {
+        if (Intents.parseJsonAction(out) == null) return Reply(out)
+        if (QUESTION.containsMatchIn(text.trim())) return Reply(speakable(out))
+        return fromCloud(ctx, out)
+    }
 
     private val PHONE_WORDS = Regex("setting|brightness|display|screen|volume|device|phone|system|ringer|wi-?fi|bluetooth", RegexOption.IGNORE_CASE)
 
@@ -672,6 +709,7 @@ object Assistant {
             garbled, work out what they most likely meant and answer that; if you really cannot tell, ask
             them to say it again.
             ${if (mem.isNotEmpty()) "Things the user has asked you to remember:\n$mem" else ""}
+            ${Knowledge.context(ctx, text).let { if (it.isNotEmpty()) "Entries from the offline library that may help (name the source if you use one):\n$it" else "" }}
 
             When the user clearly asks you to perform one of these actions, reply with ONLY a single-line JSON
             object and nothing else:
@@ -725,10 +763,18 @@ object Assistant {
 
     private suspend fun offlinePrompt(ctx: Context, text: String): String {
         val mem = relevantMemories(text)
+        val lib = Knowledge.context(ctx, text)
         return "You are AURELIS, a calm and helpful personal assistant running fully offline on the user's phone. " +
             "You have no internet access, so you cannot know news, weather, prices or anything live; if asked, say you are offline. " +
+            "If you are not sure of a fact, say you don't know rather than guessing. " +
             "Answer in one or two short spoken sentences, no lists or symbols. Current time: ${now()}." +
-            (if (mem.isNotEmpty()) "\nUser memories:\n$mem" else "")
+            "\nIf the user clearly asks you to DO something on the phone, reply with only one line of JSON, for example " +
+            "{\"action\":\"command\",\"text\":\"volume up\"} or {\"action\":\"set_reminder\",\"text\":\"call mum\",\"minutes\":30} " +
+            "or {\"action\":\"open_app\",\"name\":\"WhatsApp\"} or {\"action\":\"add_task\",\"title\":\"buy milk\"}. " +
+            "Use action command with simple words like: brightness up, torch on, open camera, go home, set a timer for 5 minutes. " +
+            "For questions and chat, answer in plain words, never JSON." +
+            (if (mem.isNotEmpty()) "\nUser memories:\n$mem" else "") +
+            (if (lib.isNotEmpty()) "\nFrom the offline library (mention the source if you use it):\n$lib" else "")
     }
 
     private fun confirmText(c: Cmd): String? = when (c) {
