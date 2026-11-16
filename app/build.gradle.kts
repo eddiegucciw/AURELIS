@@ -1,9 +1,16 @@
+import java.util.Base64
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
 }
+
+// One fixed signing key, so every new build can install over the previous one.
+val signingKeystore = rootProject.file(".signing/aurelis.keystore")
+signingKeystore.parentFile.mkdirs()
+signingKeystore.writeBytes(Base64.getMimeDecoder().decode(rootProject.file("signing/keystore.b64").readText()))
 
 val buildTime = System.currentTimeMillis()
 
@@ -22,6 +29,16 @@ android {
         ndk {
             // Modern phones only; keeps the APK smaller.
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            storeFile = signingKeystore
+            storeType = "pkcs12"
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
         }
     }
 
