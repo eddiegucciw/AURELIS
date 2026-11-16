@@ -47,6 +47,9 @@ sealed class Cmd {
     object ScreenControl : Cmd()
     object StopListening : Cmd()
     object Goodbye : Cmd()
+
+    /** A plain-words command (from the cloud brain) to run through the local command handlers. */
+    data class Phrase(val text: String) : Cmd()
 }
 
 data class Reply(
@@ -266,6 +269,7 @@ object Intents {
             else Cmd.Volume(a.optString("direction", "status"), null)
         "dial" -> Cmd.Dial(a.optString("number"))
         "sms" -> Cmd.Sms(a.optString("number"), a.optString("message"))
+        "command" -> Cmd.Phrase(a.optString("text"))
         else -> null
     }
 
@@ -276,7 +280,9 @@ object Intents {
         val e = t.lastIndexOf('}')
         if (s < 0 || e <= s) return null
         return try {
-            JSONObject(t.substring(s, e + 1)).takeIf { it.has("action") }
+            JSONObject(t.substring(s, e + 1)).takeIf {
+                it.has("action") || it.has("actions") || it.has("say") || it.has("learn")
+            }
         } catch (ex: Exception) {
             null
         }
@@ -476,7 +482,41 @@ object Assistant {
 
         val text = applyTaught(input)
 
-        // 2. Commands we can understand locally and reliably.
+        // 2. "No, I said X": learn the correction so the same mishearing is fixed next time.
+        Regex("^(?:no |nope )?(?:i said|i meant|i mean) (.+)$").find(n)?.let { m ->
+            val meant = m.groupValues[1]
+            val wrong = Learned.lastHeard
+            if (wrong.isNotBlank() && Intents.norm(wrong) != meant) Learned.fix(ctx, wrong, meant)
+            val r = act(ctx, meant, 1)
+            return r.copy(text = "Understood. " + r.text)
+        }
+        Learned.lastHeard = text
+        return act(ctx, text, 0)
+    }
+
+    /**
+     * Understands and carries out one request. Phrases the user taught, and chains joined
+     * with "and then", come back through here one step at a time.
+     */
+    private suspend fun act(ctx: Context, text: String, depth: Int): Reply {
+        if (depth < 3) {
+            val taught = Learned.resolve(ctx, text)
+            val steps = (taught ?: text).split(Regex("\\s+and then\\s+")).map { it.trim() }.filter { it.isNotEmpty() }
+            val chain = steps.size > 1 && steps.all { Intents.parse(it) != null || Skills.commandLike(it) }
+            if (steps.isNotEmpty() && (taught != null || chain)) {
+                val replies = ArrayList<Reply>()
+                for (step in steps) replies.add(act(ctx, step, depth + 1))
+                return Reply(
+                    replies.joinToString(" ") { it.text },
+                    end = replies.last().end,
+                    stopListening = replies.any { it.stopListening },
+                    leftApp = replies.any { it.leftApp }
+                )
+            }
+        }
+
+        // Commands we can understand locally and reliably.
+        Skills.handle(ctx, text)?.let { return it }
         Intents.parse(text)?.let { return run(ctx, it, confirmed = false) }
 
         // 3. Conversation with the best available brain.
@@ -486,8 +526,7 @@ object Assistant {
                 val key = SecureStore.get(ctx, "cloud_key")
                 try {
                     val out = CloudBrain.ask(key, AurelisApp.instance.prefs.cloudModel, onlinePrompt(ctx, text), history, text)
-                    val action = Intents.parseJsonAction(out)?.let { Intents.fromJson(it) }
-                    if (action != null) run(ctx, action, confirmed = false) else Reply(out.ifBlank { "I'm not sure how to answer that." })
+                    fromCloud(ctx, out)
                 } catch (e: CloudBrain.CloudError) {
                     // Fall back to the local brain rather than failing outright.
                     val local = if (LocalBrain.active(ctx) != null) LocalBrain.generate(ctx, offlinePrompt(ctx, text), history, text) else null
@@ -508,14 +547,53 @@ object Assistant {
         }
     }
 
+    /** Turns the cloud brain's answer (plain words, or JSON with actions / a fact to learn) into a reply. */
+    private suspend fun fromCloud(ctx: Context, out: String): Reply {
+        val obj = Intents.parseJsonAction(out) ?: return Reply(out.ifBlank { "I'm not sure how to answer that." })
+        val fact = obj.optString("learn").trim()
+        if (fact.isNotEmpty() && Opt.autoLearn(ctx)) learnFact(fact)
+        val cmds = ArrayList<Cmd>()
+        if (obj.has("action")) Intents.fromJson(obj)?.let { cmds.add(it) }
+        val arr = obj.optJSONArray("actions")
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                Intents.fromJson(o)?.let { cmds.add(it) }
+            }
+        }
+        val say = obj.optString("say").trim()
+        if (cmds.isEmpty()) {
+            return Reply(say.ifEmpty { if (fact.isNotEmpty()) "Noted." else "I'm not sure how to do that." })
+        }
+        val replies = ArrayList<Reply>()
+        for (c in cmds) replies.add(run(ctx, c, confirmed = false))
+        return Reply(
+            (listOf(say) + replies.map { it.text }).filter { it.isNotEmpty() }.joinToString(" "),
+            end = replies.last().end,
+            stopListening = replies.any { it.stopListening },
+            leftApp = replies.any { it.leftApp }
+        )
+    }
+
+    /** Self-learning: keeps a lasting fact about the user (visible and deletable under Memory). */
+    private suspend fun learnFact(fact: String) {
+        val dao = AurelisApp.instance.db.memories()
+        val key = Intents.norm(fact)
+        if (dao.list().none { Intents.norm(it.content) == key }) {
+            dao.insert(Memory(category = MemoryCategory.CONTEXT, content = fact))
+            log("Learned about you: $fact")
+        }
+    }
+
     private suspend fun relevantMemories(text: String): String {
         val app = AurelisApp.instance
         if (!app.prefs.useMemory) return ""
         val all = app.db.memories().list()
         if (all.isEmpty()) return ""
         val words = Intents.norm(text).split(" ").filter { it.length > 3 }.toSet()
-        val prefs = all.filter { it.category == MemoryCategory.PREFERENCES }.take(5)
-        val scored = all.filter { it.category != MemoryCategory.PREFERENCES }
+        val always = setOf(MemoryCategory.PREFERENCES, MemoryCategory.CONTEXT)
+        val prefs = all.filter { it.category in always }.take(12)
+        val scored = all.filter { it.category !in always }
             .map { m -> m to Intents.norm(m.content).split(" ").count { it in words } }
             .filter { it.second > 0 }
             .sortedByDescending { it.second }
@@ -537,6 +615,9 @@ object Assistant {
             is ambiguous, ask one short clarifying question instead of guessing.
             Your replies are spoken aloud: keep them to 1-3 natural sentences. Never use markdown, lists,
             asterisks or emoji. Current date and time: ${now()}. Mode: online.
+            The user's words reach you through speech recognition that often mishears them. If the text looks
+            garbled, work out what they most likely meant and answer that; if you really cannot tell, ask
+            them to say it again.
             ${if (mem.isNotEmpty()) "Things the user has asked you to remember:\n$mem" else ""}
 
             When the user clearly asks you to perform one of these actions, reply with ONLY a single-line JSON
@@ -556,7 +637,15 @@ object Assistant {
               {"action":"volume","percent":40}
               {"action":"dial","number":"..."}
               {"action":"sms","number":"...","message":"..."}
-            Otherwise answer normally.
+            For any other phone control, send it as plain words:
+              {"action":"command","text":"volume up"}
+            Phrases that work: volume up, volume down, mute, set volume to 60, play, pause, next song,
+            previous song, play NAME on youtube, brightness up, set brightness to 40, show my alarms,
+            cancel alarm at 6 30 am, set a timer for 10 minutes, open camera, navigate to PLACE, go home,
+            open wifi settings, call CONTACT NAME, text CONTACT NAME saying MESSAGE, delete reminder about X,
+            delete task X.
+            To do several things at once: {"say":"On it.","actions":[{"action":"torch_on"},{"action":"command","text":"volume up"}]}
+            Otherwise answer normally in plain words.
         """.trimIndent()
     }
 
@@ -586,6 +675,9 @@ object Assistant {
         }
         return when (c) {
             Cmd.Goodbye -> Reply("Very well. I'll remain on standby.", end = true)
+            is Cmd.Phrase -> Skills.handle(ctx, c.text)
+                ?: Intents.parse(c.text)?.let { p -> run(ctx, p, confirmed = false) }
+                ?: Reply("I understood, but that's something I can't do on this phone yet.")
             Cmd.StopListening -> Reply("Understood. I've paused listening. Tap the core when you need me.", end = true, stopListening = true)
             Cmd.Time -> Reply("It's " + SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date()) + ".")
             Cmd.DateToday -> Reply("Today is " + SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault()).format(Date()) + ".")
