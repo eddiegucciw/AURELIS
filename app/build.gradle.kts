@@ -5,6 +5,13 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
+// One fixed signing key, so every new build can install over the previous one.
+val signingKeystore = rootProject.file(".signing/aurelis.keystore").apply {
+    parentFile.mkdirs()
+    writeBytes(java.util.Base64.getMimeDecoder().decode(rootProject.file("signing/keystore.b64").readText()))
+}
+val buildTime = System.currentTimeMillis()
+
 android {
     namespace = "com.aurelis.app"
     compileSdk = 35
@@ -13,11 +20,23 @@ android {
         applicationId = "com.aurelis.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        // Minutes since 1970: always increases, so newer builds always count as updates.
+        versionCode = (buildTime / 60_000L).toInt()
+        versionName = "1.1"
+        buildConfigField("long", "BUILD_TIME", "${buildTime}L")
         ndk {
             // Modern phones only; keeps the APK smaller.
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            storeFile = signingKeystore
+            storeType = "pkcs12"
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
         }
     }
 
@@ -36,6 +55,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     packaging {
         jniLibs {
