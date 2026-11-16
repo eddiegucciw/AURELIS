@@ -14,14 +14,25 @@ signingKeystore.writeBytes(Base64.getMimeDecoder().decode(rootProject.file("sign
 
 val buildTime = System.currentTimeMillis()
 
-// Optional artwork: a picture uploaded to the top folder of the repo becomes the app icon
-// and the centre of the Home screen.
-val artSource = rootProject.projectDir.listFiles()
-    ?.filter { it.isFile && it.extension.lowercase() in listOf("png", "jpg", "jpeg", "webp") }
-    ?.maxByOrNull { it.length() }
+// Artwork for the app icon and the centre of the Home screen. A picture uploaded to the top
+// folder of the repo wins; otherwise the built-in artwork (text parts in signing/art*.b64) is used.
 val artRes = layout.buildDirectory.dir("generated/aurelisArt/res").get().asFile
 artRes.deleteRecursively()
 artRes.mkdirs()
+val uploadedArt = rootProject.projectDir.listFiles()
+    ?.filter { it.isFile && it.extension.lowercase() in listOf("png", "jpg", "jpeg", "webp") }
+    ?.maxByOrNull { it.length() }
+val builtInArtParts = (rootProject.file("signing").listFiles() ?: emptyArray())
+    .filter { it.name.startsWith("art") && it.name.endsWith(".b64") }
+    .sortedBy { it.name }
+val builtInArt = if (uploadedArt == null && builtInArtParts.isNotEmpty()) {
+    val f = layout.buildDirectory.file("generated/aurelisArt/builtin.webp").get().asFile
+    f.writeBytes(Base64.getMimeDecoder().decode(builtInArtParts.joinToString("") { it.readText() }))
+    f
+} else {
+    null
+}
+val artSource = uploadedArt ?: builtInArt
 artSource?.let { src ->
     src.copyTo(artRes.resolve("drawable-nodpi/aurelis_art." + src.extension.lowercase()), overwrite = true)
     artRes.resolve("drawable").mkdirs()
@@ -52,9 +63,9 @@ android {
         targetSdk = 35
         // Minutes since 1970: always increases, so newer builds always count as updates.
         versionCode = (buildTime / 60_000L).toInt()
-        versionName = "1.2"
-        buildConfigField("long", "BUILD_TIME", "${buildTime}L")
+        versionName = "1.3"
         manifestPlaceholders["appIcon"] = if (artSource != null) "@mipmap/ic_launcher_art" else "@mipmap/ic_launcher"
+        buildConfigField("long", "BUILD_TIME", "${buildTime}L")
         ndk {
             // Modern phones only; keeps the APK smaller.
             abiFilters += listOf("arm64-v8a")
