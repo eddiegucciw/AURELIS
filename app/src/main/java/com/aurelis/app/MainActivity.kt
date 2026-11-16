@@ -6,8 +6,11 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -20,6 +23,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -33,6 +37,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
@@ -41,7 +46,9 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -80,6 +87,23 @@ class MainActivity : ComponentActivity() {
         AppState.uiVisible.value = true
         Control.ensureListening(this)
         Updater.check()
+        askToStayAwake()
+    }
+
+    /**
+     * Android has no "always use the microphone" permission. What keeps listening alive is the
+     * listening notification plus being exempt from battery optimisation, so ask for that once.
+     */
+    private fun askToStayAwake() {
+        val sp = getSharedPreferences("aurelis", Context.MODE_PRIVATE)
+        if (sp.getBoolean("asked_battery", false) || !Control.hasMic(this)) return
+        if (getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)) return
+        sp.edit().putBoolean("asked_battery", true).apply()
+        try {
+            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+        } catch (e: Exception) {
+            // Some phones don't offer this screen; Settings > Permissions has the manual route.
+        }
     }
 
     override fun onPause() {
@@ -231,6 +255,9 @@ fun AiCore(state: CoreState, online: Boolean, modifier: Modifier = Modifier, onT
         0f, 1f, infiniteRepeatable(tween(480, easing = FastOutSlowInEasing), RepeatMode.Reverse), label = "beat"
     )
     val phase by tr.animateFloat(0f, (2 * PI).toFloat(), infiniteRepeatable(tween(1000, easing = LinearEasing)), label = "wave")
+    // The AURELIS artwork, if one was added to the project. It sits in the middle of the animated rings.
+    val ctx = LocalContext.current
+    val artId = remember { ctx.resources.getIdentifier("aurelis_art", "drawable", ctx.packageName) }
 
     val dim = !online && (state == CoreState.IDLE || state == CoreState.STANDBY)
     val glow = when {
@@ -267,6 +294,16 @@ fun AiCore(state: CoreState, online: Boolean, modifier: Modifier = Modifier, onT
                 radius = r * 1.9f, center = c
             )
             drawCircle(Pal.Blue.copy(alpha = 0.3f + 0.5f * intensity), r * (0.98f + 0.04f * breath), c, style = Stroke(2.dp.toPx()))
+
+            // State ring: shows around the artwork what AURELIS is doing
+            drawArc(
+                glow.copy(alpha = (0.25f + 0.75f * intensity).coerceIn(0f, 1f)),
+                if (state == CoreState.THINKING) fast else slow * 2f,
+                if (state == CoreState.THINKING || state == CoreState.STANDBY || state == CoreState.IDLE) 240f else 360f,
+                false,
+                topLeft = Offset(c.x - r * 1.2f, c.y - r * 1.2f), size = Size(r * 2.4f, r * 2.4f),
+                style = Stroke((if (state == CoreState.LISTENING || state == CoreState.SPEAKING) 5 else 3).dp.toPx(), cap = StrokeCap.Round)
+            )
 
             // Futuristic markings
             rotate(slow * 0.3f, c) {
@@ -362,7 +399,18 @@ fun AiCore(state: CoreState, online: Boolean, modifier: Modifier = Modifier, onT
                 drawPath(path, Pal.Cyan, style = Stroke(2.5.dp.toPx(), cap = StrokeCap.Round))
             }
         }
-        Text("A", color = Pal.Silver.copy(alpha = if (dim) 0.6f else 1f), fontSize = 64.sp, fontWeight = FontWeight.ExtraLight)
+        if (artId != 0) {
+            Box(Modifier.aspectRatio(1f), contentAlignment = Alignment.Center) {
+                Image(
+                    painterResource(artId), contentDescription = "AURELIS",
+                    modifier = Modifier.fillMaxSize(0.72f).clip(CircleShape),
+                    contentScale = ContentScale.Crop,
+                    alpha = if (dim) 0.75f else 1f
+                )
+            }
+        } else {
+            Text("A", color = Pal.Silver.copy(alpha = if (dim) 0.6f else 1f), fontSize = 64.sp, fontWeight = FontWeight.ExtraLight)
+        }
     }
 }
 
