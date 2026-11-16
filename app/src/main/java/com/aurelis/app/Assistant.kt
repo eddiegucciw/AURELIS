@@ -521,7 +521,9 @@ object Assistant {
         if (depth < 3) {
             val taught = Learned.resolve(ctx, text)
             val steps = (taught ?: text).split(Regex("\\s+and then\\s+")).map { it.trim() }.filter { it.isNotEmpty() }
-            val chain = steps.size > 1 && steps.all { Intents.parse(it) != null || Skills.commandLike(it) }
+            val chain = steps.size > 1 && steps.all {
+                Intents.parse(it) != null || Skills.commandLike(it) || Intents.norm(it).substringBefore(" ") in Actions.VERBS
+            }
             if (steps.isNotEmpty() && (taught != null || chain)) {
                 val replies = ArrayList<Reply>()
                 for (step in steps) replies.add(act(ctx, step, depth + 1))
@@ -543,7 +545,7 @@ object Assistant {
         }
 
         // Commands we can understand locally and reliably.
-        (MoreSkills.handle(ctx, cleaned) ?: Skills.handle(ctx, cleaned))?.let {
+        (Actions.handle(ctx, cleaned) ?: MoreSkills.handle(ctx, cleaned) ?: Skills.handle(ctx, cleaned))?.let {
             lastCommand = cleaned
             return it
         }
@@ -706,6 +708,16 @@ object Assistant {
             how far is NAIROBI CBD, youtube SEARCH, open WEBSITE, news about TOPIC, whatsapp NAME saying MESSAGE,
             email ADDRESS about SUBJECT saying BODY, add contact NAME 0712345678, convert 5 km to miles,
             create a routine called NAME that does A and then B, check for updates.
+            Screen control (works inside any app): scroll down, scroll to the top, swipe left, go back, go home,
+            recent apps, tap NAME, tap the third result, long press NAME, type TEXT, clear this field, select all,
+            copy, paste, press enter, read my screen, what's on my screen, summarise this page, explain this error,
+            translate this page into Swahili, list the buttons, find the word X, lock the phone, take a screenshot,
+            open quick settings, read my notifications, clear notifications, close this app.
+            Files: find my PDFs, open the first file, summarise the first pdf, rename X to Y, move X to downloads,
+            delete the file X, share it, organise my downloads, find duplicate files, create a folder called X.
+            Camera and media: take a photo, take a selfie, switch camera, describe my latest photo, show my latest photo.
+            Workflows: search youtube for X and open the third result. Money: convert 100 dollars to shillings.
+            GitHub: check build status, show commit history.
             To do several things at once: {"say":"On it.","actions":[{"action":"torch_on"},{"action":"command","text":"volume up"}]}
             Otherwise answer normally in plain words.
         """.trimIndent()
@@ -737,7 +749,7 @@ object Assistant {
         }
         return when (c) {
             Cmd.Goodbye -> Reply("Very well. I'll remain on standby.", end = true)
-            is Cmd.Phrase -> (MoreSkills.handle(ctx, c.text) ?: Skills.handle(ctx, c.text))
+            is Cmd.Phrase -> (Actions.handle(ctx, c.text) ?: MoreSkills.handle(ctx, c.text) ?: Skills.handle(ctx, c.text))
                 ?: Intents.parse(c.text)?.let { p -> run(ctx, p, confirmed = false) }
                 ?: Reply("I understood, but that's something I can't do on this phone yet.")
             Cmd.StopListening -> Reply("Understood. I've paused listening. Tap the core when you need me.", end = true, stopListening = true)
@@ -813,7 +825,7 @@ object Assistant {
                     end = true, leftApp = true
                 ) else Reply("I couldn't open the Clock app on this phone.")
             }
-            Cmd.ScreenControl -> Reply("I can't scroll or tap inside other apps yet. That needs Android's accessibility permission, which this version doesn't use.")
+            Cmd.ScreenControl -> Reply("Screen control needs Accessibility. Open the setup screen from Home and switch on Screen control.")
             Cmd.ClearReminders -> {
                 val list = app.db.reminders().pending()
                 list.forEach {
