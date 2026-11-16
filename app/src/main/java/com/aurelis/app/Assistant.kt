@@ -396,7 +396,7 @@ object Assistant {
     fun mode(ctx: Context): BrainMode {
         val hasKey = SecureStore.get(ctx, "cloud_key").isNotBlank()
         return when {
-            AppState.online.value && hasKey -> BrainMode.ONLINE
+            AppState.online.value && hasKey && !Opt2.forceOffline(ctx) -> BrainMode.ONLINE
             LocalBrain.active(ctx) != null -> BrainMode.OFFLINE
             else -> BrainMode.LIMITED
         }
@@ -494,6 +494,25 @@ object Assistant {
         return act(ctx, text, 0)
     }
 
+    private var lastCommand = ""
+
+    private val LEAD = Regex(
+        "^(?:(?:hey|hi|hello|okay|ok|yo|dear)\\s+)?(?:aurelis|aurelius|aureli|oralis|aurora lis)[,.!]?\\s+|" +
+            "^(?:please|kindly|can you|could you|would you|will you|i want you to|i need you to|i'd like you to|help me)\\s+",
+        RegexOption.IGNORE_CASE
+    )
+
+    /** Drops "AURELIS," "please", "can you" and the like from the front of a command. */
+    private fun clean(text: String): String {
+        var t = text.trim()
+        repeat(3) {
+            val next = t.replace(LEAD, "").trim()
+            if (next.isEmpty() || next == t) return t.removeSuffix("please").removeSuffix(" please").trim().ifEmpty { text }
+            t = next
+        }
+        return t.removeSuffix(" please").trim()
+    }
+
     /**
      * Understands and carries out one request. Phrases the user taught, and chains joined
      * with "and then", come back through here one step at a time.
@@ -515,9 +534,23 @@ object Assistant {
             }
         }
 
+        // "Do that again" repeats the last thing AURELIS did on the phone.
+        val cleaned = clean(text)
+        val cn = Intents.norm(cleaned)
+        if (Regex("^(do (that|it) again|again|one more time|same again|repeat (that|the last) (command|action)|do the same)$").matches(cn)) {
+            if (lastCommand.isEmpty()) return Reply("I haven't done anything yet to repeat.")
+            return act(ctx, lastCommand, depth + 1)
+        }
+
         // Commands we can understand locally and reliably.
-        Skills.handle(ctx, text)?.let { return it }
-        Intents.parse(text)?.let { return run(ctx, it, confirmed = false) }
+        (MoreSkills.handle(ctx, cleaned) ?: Skills.handle(ctx, cleaned))?.let {
+            lastCommand = cleaned
+            return it
+        }
+        Intents.parse(cleaned)?.let {
+            lastCommand = cleaned
+            return run(ctx, it, confirmed = false)
+        }
 
         // 3. Conversation with the best available brain.
         val history = AppState.messages.value.dropLast(1)
@@ -547,9 +580,27 @@ object Assistant {
         }
     }
 
+    private val REFUSAL = Regex(
+        "(don't|do not|doesn't|cannot|can't|unable to|not able to|no) (have )?(the )?(necessary |required |system )*(permission|access|ability|capabilit)|" +
+            "i (can't|cannot|am unable to|am not able to) (change|adjust|control|access|modify) (your|the) (phone|device|display|screen|settings|brightness|volume)",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val PHONE_WORDS = Regex("setting|brightness|display|screen|volume|device|phone|system|ringer|wi-?fi|bluetooth", RegexOption.IGNORE_CASE)
+
     /** Turns the cloud brain's answer (plain words, or JSON with actions / a fact to learn) into a reply. */
     private suspend fun fromCloud(ctx: Context, out: String): Reply {
-        val obj = Intents.parseJsonAction(out) ?: return Reply(out.ifBlank { "I'm not sure how to answer that." })
+        val obj = Intents.parseJsonAction(out)
+        if (obj == null) {
+            // The cloud sometimes claims it can't touch the phone. It can, through me, so never pass that on.
+            if (REFUSAL.containsMatchIn(out) && PHONE_WORDS.containsMatchIn(out)) {
+                return Reply(
+                    "I can do that on the phone, I just didn't catch exactly which setting you meant. " +
+                        "Try saying it like: brightness up, set volume to 50, do not disturb on, or open display settings."
+                )
+            }
+            return Reply(out.ifBlank { "I'm not sure how to answer that." })
+        }
         val fact = obj.optString("learn").trim()
         if (fact.isNotEmpty() && Opt.autoLearn(ctx)) learnFact(fact)
         val cmds = ArrayList<Cmd>()
@@ -644,6 +695,17 @@ object Assistant {
             cancel alarm at 6 30 am, set a timer for 10 minutes, open camera, navigate to PLACE, go home,
             open wifi settings, call CONTACT NAME, text CONTACT NAME saying MESSAGE, delete reminder about X,
             delete task X.
+            IMPORTANT: you DO control this phone through these actions. Never say you lack permission, access or the
+            ability to change a phone setting (brightness, volume, display, sound, Do Not Disturb, rotation, text size,
+            Wi-Fi, apps, alarms and so on). Always send it as an action or a command instead; if Android needs a
+            permission, the phone itself will open the right switch and explain it to the user.
+            More phrases that work: increase screen brightness, auto brightness, screen timeout 2 minutes, auto rotate off,
+            bigger text, do not disturb on, silent mode, ring volume up, alarm volume 80, change voice, private mode,
+            run diagnostics, how much storage, check internet, android version, open display settings, open battery settings,
+            open downloads, open gallery, open calendar, record a video, cancel timer, snooze, find petrol stations near me,
+            how far is NAIROBI CBD, youtube SEARCH, open WEBSITE, news about TOPIC, whatsapp NAME saying MESSAGE,
+            email ADDRESS about SUBJECT saying BODY, add contact NAME 0712345678, convert 5 km to miles,
+            create a routine called NAME that does A and then B, check for updates.
             To do several things at once: {"say":"On it.","actions":[{"action":"torch_on"},{"action":"command","text":"volume up"}]}
             Otherwise answer normally in plain words.
         """.trimIndent()
@@ -675,7 +737,7 @@ object Assistant {
         }
         return when (c) {
             Cmd.Goodbye -> Reply("Very well. I'll remain on standby.", end = true)
-            is Cmd.Phrase -> Skills.handle(ctx, c.text)
+            is Cmd.Phrase -> (MoreSkills.handle(ctx, c.text) ?: Skills.handle(ctx, c.text))
                 ?: Intents.parse(c.text)?.let { p -> run(ctx, p, confirmed = false) }
                 ?: Reply("I understood, but that's something I can't do on this phone yet.")
             Cmd.StopListening -> Reply("Understood. I've paused listening. Tap the core when you need me.", end = true, stopListening = true)
