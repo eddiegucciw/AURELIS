@@ -2,16 +2,15 @@ package com.aurelis.app
 
 import android.content.Context
 import android.content.Intent
-import androidx.core.content.FileProvider
+import android.net.Uri
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONObject
-import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.time.Instant
 
-/** In-app updates: finds the newest build on GitHub and installs it over this one. */
+/** In-app updates: finds the newest build on GitHub and offers it from the Home screen. */
 object Updater {
     private const val LATEST = "https://api.github.com/repos/eddiegucciw/AURELIS/releases/latest"
 
@@ -51,26 +50,13 @@ object Updater {
         }
     }
 
+    /** Opens the new build's download; Android then installs it over this app, keeping all data. */
     fun install(ctx: Context) {
         val url = available.value ?: return
-        if (progress.value >= 0) return
-        val app = ctx.applicationContext
-        progress.value = 0
-        Bg.scope.launch {
-            try {
-                val apk = File(File(app.cacheDir, "update"), "AURELIS.apk")
-                Downloader.download(url, apk) { progress.value = it }
-                val uri = FileProvider.getUriForFile(app, app.packageName + ".files", apk)
-                app.startActivity(
-                    Intent(Intent.ACTION_VIEW)
-                        .setDataAndType(uri, "application/vnd.android.package-archive")
-                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            } catch (e: Exception) {
-                AppState.status.value = "Update download failed. Check your internet and try again."
-            } finally {
-                progress.value = -1
-            }
+        try {
+            ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+            AppState.status.value = "Couldn't open the update download."
         }
     }
 }
