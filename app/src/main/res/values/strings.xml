@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="access_summary">Lets AURELIS scroll, tap, type and read the screen when you ask it to by voice.</string>
+    <string name="access_description">AURELIS uses this to carry out your spoken commands in other apps: scrolling, tapping, typing, going back or home, reading what is on the screen and taking screenshots you ask for. It only acts when you give a command, it never records the screen in the background, and nothing is sent anywhere unless you ask a question that needs the online brain.</string>
+</resources>
