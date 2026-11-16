@@ -55,25 +55,37 @@ artSource?.let { src ->
     )
 }
 
-// Offline speech built in: the build machine downloads the English speech pack once and packs it
-// into the app, so listening works offline from the first launch with nothing to download.
-val voskZip = rootProject.file(".cache/vosk-model-small-en-us-0.15.zip")
-if (!voskZip.exists() || voskZip.length() < 30_000_000L) {
-    voskZip.parentFile.mkdirs()
-    try {
-        val part = File(voskZip.path + ".part")
-        URL("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip").openStream().use { input ->
-            part.outputStream().use { input.copyTo(it) }
-        }
-        if (part.length() > 30_000_000L) part.renameTo(voskZip) else part.delete()
-    } catch (e: Exception) {
-        println("AURELIS: couldn't download the offline speech pack: " + e.message)
+// Speech models are NOT packed into the app any more (smaller download and install).
+// The phone downloads the Vosk wake-word pack and the optional Whisper pack once, into app storage,
+// where they survive app updates. Only the tiny Silero voice-activity model (about 2 MB) is built in,
+// so AURELIS can tell speech from silence and notice when you talk over it, even offline.
+fun fetchOnce(url: String, dest: File, minBytes: Long) {
+    if (dest.exists() && dest.length() >= minBytes) return
+    dest.parentFile.mkdirs()
+    val part = File(dest.path + ".part")
+    URL(url).openStream().use { input -> part.outputStream().use { input.copyTo(it) } }
+    if (part.length() < minBytes) {
+        part.delete()
+        throw GradleException("AURELIS: download too small: $url")
     }
+    dest.delete()
+    part.renameTo(dest)
 }
+
+// sherpa-onnx (Apache-2.0): runs Whisper tiny.en and Silero VAD on the phone. Official release AAR.
+val sherpaVersion = "1.12.20"
+val sherpaAar = rootProject.file(".cache/sherpa-onnx-$sherpaVersion.aar")
+fetchOnce(
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$sherpaVersion/sherpa-onnx-$sherpaVersion.aar",
+    sherpaAar, 5_000_000L
+)
+
 val speechAssets = layout.buildDirectory.dir("generated/aurelisAssets").get().asFile
 speechAssets.deleteRecursively()
 speechAssets.mkdirs()
-if (voskZip.exists()) voskZip.copyTo(speechAssets.resolve("vosk-model.zip"), overwrite = true)
+val sileroVad = rootProject.file(".cache/silero_vad.onnx")
+fetchOnce("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx", sileroVad, 200_000L)
+sileroVad.copyTo(speechAssets.resolve("silero_vad.onnx"), overwrite = true)
 
 android {
     namespace = "com.aurelis.app"
@@ -85,7 +97,7 @@ android {
         targetSdk = 35
         // Minutes since 1970: always increases, so newer builds always count as updates.
         versionCode = (buildTime / 60_000L).toInt()
-        versionName = "2.0"
+        versionName = "2.1"
         manifestPlaceholders["appIcon"] = if (artSource != null) "@mipmap/ic_launcher_art" else "@mipmap/ic_launcher"
         buildConfigField("long", "BUILD_TIME", "${buildTime}L")
         ndk {
@@ -107,7 +119,7 @@ android {
     sourceSets["main"].res.srcDir(artRes)
     sourceSets["main"].assets.srcDir(speechAssets)
     androidResources {
-        noCompress += "zip"
+        noCompress += listOf("zip", "onnx")
     }
 
     buildTypes {
@@ -130,6 +142,7 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            pickFirsts += setOf("**/libc++_shared.so", "**/libonnxruntime.so")
         }
         resources {
             excludes += setOf("META-INF/*.kotlin_module", "META-INF/AL2.0", "META-INF/LGPL2.1")
@@ -157,6 +170,9 @@ dependencies {
     // Offline speech recognition + local wake word
     implementation("com.alphacephei:vosk-android:0.3.47@aar")
     implementation("net.java.dev.jna:jna:5.13.0@aar")
+
+    // Offline speech-to-text (Whisper tiny.en) and voice-activity detection (Silero VAD)
+    implementation(files(sherpaAar))
 
     // Offline AI brain (on-device language model)
     implementation("com.google.mediapipe:tasks-genai:0.10.27")
