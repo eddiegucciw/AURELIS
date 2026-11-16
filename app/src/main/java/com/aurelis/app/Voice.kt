@@ -24,6 +24,11 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipInputStream
 
+/** Live sound levels for the waves on the Home screen (0 = silence, 1 = loud). */
+object Levels {
+    val mic = MutableStateFlow(0f)
+}
+
 /** Offline text-to-speech using the phone's installed voices. */
 object Voice {
     private var tts: TextToSpeech? = null
@@ -116,7 +121,6 @@ object WakeWord {
         "hey our ellis", "hey oralis", "hey a really's", "hey really is", "hey arealis",
         "hey aurelio", "hey or alice", "hey aurelis", "okay aurelius", "hi aurelius", "hey ralis"
     )
-    private val HELLO = Regex("\\bhello\\b")
 
     /** Words the standby recogniser is limited to, which makes wake-word detection far more reliable. */
     fun grammar(prefs: Prefs): String {
@@ -139,7 +143,7 @@ object WakeWord {
         if (t.isEmpty()) return false
         // A plain "hello" also wakes AURELIS, but only from standby: while it is speaking, its own
         // voice could say "hello" and interrupt itself.
-        if (AppState.core.value == CoreState.STANDBY && HELLO.containsMatchIn(t)) return true
+        if (AppState.core.value == CoreState.STANDBY && t.startsWith("hello") && t.split(" ").size <= 4) return true
         if (variants.any { v -> norm(v).let { it.isNotEmpty() && t.contains(it) } }) return true
         // Fuzzy: a greeting followed by 1-3 words that together sound like "aurelis".
         val words = t.split(" ")
@@ -272,6 +276,41 @@ object Ears {
 
     fun isLoaded() = model != null
 
+    /** Name of the speech pack built into the app, so offline listening works with no download. */
+    const val ASSET = "vosk-model.zip"
+
+    /** Unpacks the built-in speech pack, if this build carries one. Blocking. Returns true when ready. */
+    @Synchronized
+    fun installFromApp(ctx: Context): Boolean {
+        if (isInstalled(ctx)) return true
+        return try {
+            ctx.assets.open(ASSET).use { input ->
+                ZipInputStream(input.buffered()).use { zis ->
+                    val target = ctx.filesDir
+                    while (true) {
+                        val entry = zis.nextEntry ?: break
+                        val out = File(target, entry.name)
+                        if (!out.canonicalPath.startsWith(target.canonicalPath)) continue
+                        if (entry.isDirectory) {
+                            out.mkdirs()
+                        } else {
+                            out.parentFile?.mkdirs()
+                            out.outputStream().use { zis.copyTo(it) }
+                        }
+                    }
+                }
+            }
+            isInstalled(ctx)
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** How sure the recogniser was about its last final result, 0 to 1. */
+    @Volatile
+    var lastConfidence = 1f
+        private set
+
     /** Downloads (~40 MB) and unpacks the offline English speech model. Blocking. */
     fun install(ctx: Context) {
         val zip = File(ctx.cacheDir, "$MODEL_NAME.zip")
@@ -296,7 +335,7 @@ object Ears {
     @Synchronized
     fun load(ctx: Context): Boolean {
         if (model != null) return true
-        if (!isInstalled(ctx)) return false
+        if (!isInstalled(ctx) && !installFromApp(ctx)) return false
         return try {
             model = Model(modelDir(ctx).absolutePath)
             true
@@ -335,6 +374,10 @@ object Ears {
             onFail(e.message ?: "Could not start offline listening")
             return false
         }
+        try {
+            rec.setWords(true)
+        } catch (e: Throwable) {
+        }
         val audio = try {
             val min = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
             AudioRecord(
@@ -362,9 +405,17 @@ object Ears {
                     val got = audio.read(buf, 0, buf.size)
                     if (got < 0) throw IOException("Microphone stopped")
                     if (got == 0) continue
+                    var sum = 0.0
+                    for (k in 0 until got) {
+                        val v = buf[k].toDouble()
+                        sum += v * v
+                    }
+                    Levels.mic.value = (Math.sqrt(sum / got) / 2500.0).toFloat().coerceIn(0f, 1f)
                     if (onClap != null && claps.feed(buf, got)) main.post { if (runId == id) onClap() }
                     if (rec.acceptWaveForm(buf, got)) {
-                        val text = parse(rec.result, "text")
+                        val json = rec.result
+                        val text = parse(json, "text")
+                        lastConfidence = confidence(json)
                         lastPartial = ""
                         main.post { if (runId == id) onFinal(text) }
                     } else {
@@ -378,6 +429,7 @@ object Ears {
             } catch (e: Throwable) {
                 main.post { if (runId == id) onFail(e.message ?: "Microphone error") }
             } finally {
+                Levels.mic.value = 0f
                 try {
                     audio.stop()
                 } catch (e: Throwable) {
@@ -399,6 +451,20 @@ object Ears {
             t.join(400)
         } catch (e: InterruptedException) {
         }
+    }
+
+    /** Average word confidence from a Vosk result (1 when the recogniser gives none). */
+    private fun confidence(json: String?): Float = try {
+        val arr = JSONObject(json ?: "{}").optJSONArray("result")
+        if (arr == null || arr.length() == 0) {
+            1f
+        } else {
+            var total = 0.0
+            for (i in 0 until arr.length()) total += arr.getJSONObject(i).optDouble("conf", 1.0)
+            (total / arr.length()).toFloat()
+        }
+    } catch (e: Exception) {
+        1f
     }
 
     private fun parse(json: String?, field: String): String =
@@ -449,7 +515,7 @@ class ClapDetector {
                 // slowly follow the background, faster when it gets quieter
                 floor = if (peak < floor) floor * 0.9 + peak * 0.1 else floor * 0.995 + peak * 0.005
                 if (runLength > 0) {
-                    val sharp = runLength <= 7 && runPeak > maxOf(3500.0, before * 6.0)
+                    val sharp = runLength <= 7 && runPeak > maxOf(4000.0, before * 8.0)
                     if (sharp) {
                         val gap = frame - lastClapFrame
                         if (gap in 12L..100L) {
