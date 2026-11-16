@@ -145,11 +145,15 @@ object Control {
             if (AppState.uiVisible.value) startStandby(app)
             return
         }
-        if (preparing || !AppState.online.value || AppState.speechDownload.value >= 0) return
+        if (preparing || AppState.speechDownload.value >= 0) return
         preparing = true
         Bg.scope.launch {
             try {
-                Ears.install(app)
+                // The speech pack is built into the app; only very old builds need to download it.
+                if (!Ears.installFromApp(app)) {
+                    if (!AppState.online.value) return@launch
+                    Ears.install(app)
+                }
                 withContext(Dispatchers.Main) { ensureListening(app) }
             } catch (e: Exception) {
                 AppState.status.value = "Couldn't download the speech pack. Check your internet, then reopen AURELIS."
@@ -185,14 +189,12 @@ fun AurelisRoot() {
     // When the speech pack finishes downloading (from anywhere), start listening straight away.
     LaunchedEffect(speechProgress) { if (speechProgress < 0) Control.ensureListening(ctx) }
     val requestPerms: () -> Unit = {
-        val need = mutableListOf<String>()
-        if (!Control.hasMic(ctx)) need += Manifest.permission.RECORD_AUDIO
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) need += Manifest.permission.POST_NOTIFICATIONS
-        if (need.isNotEmpty()) launcher.launch(need.toTypedArray())
+        val need = Needs.runtime(ctx)
+        if (need.isNotEmpty()) launcher.launch(need)
     }
     LaunchedEffect(Unit) { requestPerms() }
+    val sp = remember { ctx.getSharedPreferences("aurelis", Context.MODE_PRIVATE) }
+    var showSetup by rememberSaveable { mutableStateOf(!sp.getBoolean("setup_seen", false)) }
 
     MaterialTheme(
         colorScheme = darkColorScheme(
@@ -207,10 +209,16 @@ fun AurelisRoot() {
     ) {
         val names = listOf("Home", "Intelligence", "Memory", "Command", "Settings")
         val icons = listOf(Icons.Default.Home, Icons.Default.AutoAwesome, Icons.Default.Psychology, Icons.Default.Bolt, Icons.Default.Settings)
+        if (showSetup) {
+            SetupScreen(requestPerms) {
+                sp.edit().putBoolean("setup_seen", true).apply()
+                showSetup = false
+            }
+        } else {
         Scaffold(
             containerColor = Pal.Midnight,
             bottomBar = {
-                NavigationBar(containerColor = Pal.Navy) {
+                NavigationBar(containerColor = Color(0xFF070F1D), tonalElevation = 0.dp) {
                     names.forEachIndexed { i, name ->
                         NavigationBarItem(
                             selected = tab == i,
@@ -231,7 +239,7 @@ fun AurelisRoot() {
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding).background(Pal.Midnight)) {
                 when (tab) {
-                    0 -> HomeScreen(requestPerms) { tab = 4 }
+                    0 -> HomeScreen(requestPerms, { tab = 4 }, { showSetup = true })
                     1 -> IntelligenceScreen(requestPerms)
                     2 -> MemoryScreen()
                     3 -> CommandScreen()
@@ -239,418 +247,7 @@ fun AurelisRoot() {
                 }
             }
         }
-    }
-}
-
-// ---------------------------------------------------------------------- AI core
-
-@Composable
-fun AiCore(state: CoreState, online: Boolean, modifier: Modifier = Modifier, onTap: () -> Unit) {
-    val tr = rememberInfiniteTransition(label = "core")
-    val slow by tr.animateFloat(0f, 360f, infiniteRepeatable(tween(18000, easing = LinearEasing)), label = "slow")
-    val fast by tr.animateFloat(0f, 360f, infiniteRepeatable(tween(1500, easing = LinearEasing)), label = "fast")
-    val breath by tr.animateFloat(
-        0f, 1f, infiniteRepeatable(tween(2600, easing = FastOutSlowInEasing), RepeatMode.Reverse), label = "breath"
-    )
-    val beat by tr.animateFloat(
-        0f, 1f, infiniteRepeatable(tween(480, easing = FastOutSlowInEasing), RepeatMode.Reverse), label = "beat"
-    )
-    val phase by tr.animateFloat(0f, (2 * PI).toFloat(), infiniteRepeatable(tween(1000, easing = LinearEasing)), label = "wave")
-    // The AURELIS artwork, if one was added to the project. When it is there, it becomes the core itself.
-    val ctx = LocalContext.current
-    val artId = remember { ctx.resources.getIdentifier("aurelis_art", "drawable", ctx.packageName) }
-
-    val dim = !online && (state == CoreState.IDLE || state == CoreState.STANDBY)
-    val glow = when {
-        state == CoreState.ERROR -> Pal.Amber
-        state == CoreState.THINKING -> Pal.Blue
-        dim -> Pal.Blue
-        else -> Pal.Cyan
-    }
-    val intensity = (when (state) {
-        CoreState.WAKE -> 1f
-        CoreState.SPEAKING -> 0.6f + 0.4f * beat
-        CoreState.LISTENING -> 0.9f
-        CoreState.THINKING -> 0.75f
-        CoreState.STANDBY -> 0.35f + 0.4f * breath
-        CoreState.ERROR -> 0.5f + 0.4f * beat
-        CoreState.OFFLINE -> 0.3f
-        CoreState.IDLE -> 0.35f + 0.2f * breath
-    }) * (if (dim) 0.6f else 1f)
-
-    if (artId != 0) {
-        ArtCore(artId, state, glow, intensity, dim, slow, fast, breath, beat, phase, modifier, onTap)
-        return
-    }
-
-    Box(
-        modifier.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onTap() },
-        contentAlignment = Alignment.Center
-    ) {
-        Canvas(Modifier.aspectRatio(1f)) {
-            val c = center
-            val r = size.minDimension * 0.36f
-
-            // Outer illumination
-            drawCircle(
-                brush = Brush.radialGradient(
-                    listOf(glow.copy(alpha = 0.30f * intensity), Pal.Blue.copy(alpha = 0.08f * intensity), Color.Transparent),
-                    center = c, radius = r * 1.9f
-                ),
-                radius = r * 1.9f, center = c
-            )
-            drawCircle(Pal.Blue.copy(alpha = 0.3f + 0.5f * intensity), r * (0.98f + 0.04f * breath), c, style = Stroke(2.dp.toPx()))
-
-            // State ring: shows around the artwork what AURELIS is doing
-            drawArc(
-                glow.copy(alpha = (0.25f + 0.75f * intensity).coerceIn(0f, 1f)),
-                if (state == CoreState.THINKING) fast else slow * 2f,
-                if (state == CoreState.THINKING || state == CoreState.STANDBY || state == CoreState.IDLE) 240f else 360f,
-                false,
-                topLeft = Offset(c.x - r * 1.2f, c.y - r * 1.2f), size = Size(r * 2.4f, r * 2.4f),
-                style = Stroke((if (state == CoreState.LISTENING || state == CoreState.SPEAKING) 5 else 3).dp.toPx(), cap = StrokeCap.Round)
-            )
-
-            // Futuristic markings
-            rotate(slow * 0.3f, c) {
-                for (i in 0 until 72) {
-                    val a = Math.toRadians(i * 5.0)
-                    val long = i % 6 == 0
-                    val r1 = r * 1.06f
-                    val r2 = r * (if (long) 1.13f else 1.09f)
-                    drawLine(
-                        Pal.Silver.copy(alpha = if (long) 0.5f else 0.2f),
-                        Offset(c.x + (cos(a) * r1).toFloat(), c.y + (sin(a) * r1).toFloat()),
-                        Offset(c.x + (cos(a) * r2).toFloat(), c.y + (sin(a) * r2).toFloat()),
-                        strokeWidth = 1.2.dp.toPx()
-                    )
-                }
-            }
-
-            // Cyan light channel
-            drawCircle(glow.copy(alpha = 0.45f + 0.5f * intensity), r * 0.91f, c, style = Stroke(3.dp.toPx()))
-
-            // Titanium-silver metallic segments
-            rotate(-slow, c) {
-                for (i in 0 until 12) {
-                    drawArc(
-                        Pal.Silver.copy(alpha = 0.75f), i * 30f + 4f, 22f, false,
-                        topLeft = Offset(c.x - r * 0.79f, c.y - r * 0.79f), size = Size(r * 1.58f, r * 1.58f),
-                        style = Stroke(7.dp.toPx())
-                    )
-                }
-            }
-
-            // Amber orbit accents
-            drawArc(
-                Pal.Amber.copy(alpha = if (dim) 0.4f else 0.9f), slow * 1.5f, 55f, false,
-                topLeft = Offset(c.x - r * 0.69f, c.y - r * 0.69f), size = Size(r * 1.38f, r * 1.38f),
-                style = Stroke(4.dp.toPx(), cap = StrokeCap.Round)
-            )
-            val oa = Math.toRadians((slow * 2f).toDouble())
-            drawCircle(
-                Pal.Amber, 4.dp.toPx(),
-                Offset(c.x + (cos(oa) * r * 1.0f).toFloat(), c.y + (sin(oa) * r * 1.0f).toFloat())
-            )
-
-            // Inner arcs: rotating blue segments while thinking, cyan sweep otherwise
-            val ir = r * 0.64f
-            if (state == CoreState.THINKING) {
-                for (i in 0 until 3) {
-                    drawArc(
-                        Pal.Blue, fast + i * 120f, 70f, false,
-                        topLeft = Offset(c.x - ir, c.y - ir), size = Size(ir * 2, ir * 2),
-                        style = Stroke(5.dp.toPx(), cap = StrokeCap.Round)
-                    )
-                }
-            } else {
-                drawArc(
-                    glow, -slow, 115f, false,
-                    topLeft = Offset(c.x - ir, c.y - ir), size = Size(ir * 2, ir * 2),
-                    style = Stroke(4.dp.toPx(), cap = StrokeCap.Round)
-                )
-            }
-
-            // Speaking: cyan and amber pulses
-            if (state == CoreState.SPEAKING) {
-                drawCircle(Pal.Amber.copy(alpha = 0.55f * (1f - beat)), r * (0.6f + 0.45f * beat), c, style = Stroke(2.dp.toPx()))
-                drawCircle(Pal.Cyan.copy(alpha = 0.5f * beat), r * (0.7f + 0.3f * (1f - beat)), c, style = Stroke(2.dp.toPx()))
-            }
-            // Wake: bright activation pulse
-            if (state == CoreState.WAKE) {
-                drawCircle(Pal.Cyan.copy(alpha = 0.9f), r * (1.0f + 0.1f * beat), c, style = Stroke(6.dp.toPx()))
-            }
-
-            // Dark digital orb
-            val orb = r * 0.56f
-            drawCircle(
-                brush = Brush.radialGradient(
-                    listOf(Color(0xFF203C59), Color(0xFF0A192C), Pal.Midnight), center = c, radius = orb
-                ),
-                radius = orb, center = c
-            )
-            drawCircle(glow.copy(alpha = 0.8f), orb, c, style = Stroke(2.dp.toPx()))
-
-            // Listening: animated cyan waveform across the orb
-            if (state == CoreState.LISTENING) {
-                val path = Path()
-                val steps = 48
-                for (i in 0..steps) {
-                    val fx = i / steps.toFloat()
-                    val x = c.x - orb * 0.85f + fx * orb * 1.7f
-                    val env = sin(fx * PI).toFloat()
-                    val y = c.y + orb * 0.55f + sin(fx * 14f + phase) * orb * 0.16f * env * (0.6f + 0.4f * abs(sin(phase * 0.5f)))
-                    if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
-                }
-                drawPath(path, Pal.Cyan, style = Stroke(2.5.dp.toPx(), cap = StrokeCap.Round))
-            }
         }
-        Text("A", color = Pal.Silver.copy(alpha = if (dim) 0.6f else 1f), fontSize = 64.sp, fontWeight = FontWeight.ExtraLight)
-    }
-}
-
-/**
- * The Home core when the AURELIS artwork is installed: the picture itself is the core, shown whole,
- * and the animation lives around it and on its own rings, so nothing is drawn over the logo.
- */
-@Composable
-private fun ArtCore(
-    artId: Int, state: CoreState, glow: Color, intensity: Float, dim: Boolean,
-    slow: Float, fast: Float, breath: Float, beat: Float, phase: Float,
-    modifier: Modifier, onTap: () -> Unit
-) {
-    val scale = when (state) {
-        CoreState.SPEAKING -> 1f + 0.025f * beat
-        CoreState.WAKE -> 1.03f
-        CoreState.LISTENING -> 1.01f + 0.01f * breath
-        else -> 1f + 0.012f * breath
-    }
-    Box(
-        modifier.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onTap() },
-        contentAlignment = Alignment.Center
-    ) {
-        // Behind the picture: a soft glow in the colour of what AURELIS is doing.
-        Canvas(Modifier.aspectRatio(1f)) {
-            val c = center
-            val r = size.minDimension * 0.40f
-            drawCircle(
-                brush = Brush.radialGradient(
-                    listOf(
-                        glow.copy(alpha = 0.55f * intensity), glow.copy(alpha = 0.18f * intensity), Color.Transparent
-                    ),
-                    center = c, radius = r * 1.32f
-                ),
-                radius = r * 1.32f, center = c
-            )
-            // Thin orbit that shows the state, outside the picture.
-            drawArc(
-                glow.copy(alpha = (0.3f + 0.6f * intensity).coerceIn(0f, 1f)),
-                if (state == CoreState.THINKING) fast else slow * 2f,
-                if (state == CoreState.THINKING) 120f else if (state == CoreState.LISTENING || state == CoreState.SPEAKING) 360f else 200f,
-                false,
-                topLeft = Offset(c.x - r * 1.12f, c.y - r * 1.12f), size = Size(r * 2.24f, r * 2.24f),
-                style = Stroke(2.5.dp.toPx(), cap = StrokeCap.Round)
-            )
-            val oa = Math.toRadians((slow * 2f).toDouble())
-            drawCircle(
-                Pal.Amber.copy(alpha = if (dim) 0.5f else 1f), 3.5.dp.toPx(),
-                Offset(c.x + (cos(oa) * r * 1.12f).toFloat(), c.y + (sin(oa) * r * 1.12f).toFloat())
-            )
-            if (state == CoreState.SPEAKING) {
-                drawCircle(Pal.Amber.copy(alpha = 0.5f * (1f - beat)), r * (1.02f + 0.2f * beat), c, style = Stroke(2.dp.toPx()))
-                drawCircle(Pal.Cyan.copy(alpha = 0.45f * beat), r * (1.05f + 0.12f * (1f - beat)), c, style = Stroke(2.dp.toPx()))
-            }
-            if (state == CoreState.WAKE) {
-                drawCircle(Pal.Cyan.copy(alpha = 0.85f), r * (1.04f + 0.06f * beat), c, style = Stroke(4.dp.toPx()))
-            }
-        }
-        // The picture, whole and sharp.
-        Image(
-            painterResource(artId), contentDescription = "AURELIS",
-            modifier = Modifier
-                .fillMaxSize(0.80f)
-                .aspectRatio(1f)
-                .graphicsLayer { scaleX = scale; scaleY = scale }
-                .clip(CircleShape),
-            contentScale = ContentScale.Fit,
-            alpha = if (dim) 0.7f else 1f
-        )
-        // On top, only light: the microphone glows while listening, the inner ring spins while thinking.
-        Canvas(
-            Modifier
-                .aspectRatio(1f)
-                .graphicsLayer { scaleX = scale; scaleY = scale }
-        ) {
-            val c = center
-            val r = size.minDimension * 0.40f
-            when (state) {
-                CoreState.LISTENING -> {
-                    val mic = Offset(c.x, c.y + r * 0.5f)
-                    val pulse = 0.5f + 0.5f * sin(phase).toFloat()
-                    drawCircle(Pal.Cyan.copy(alpha = 0.35f + 0.4f * pulse), r * (0.2f + 0.05f * pulse), mic, style = Stroke(3.dp.toPx()))
-                    drawCircle(Pal.Cyan.copy(alpha = 0.25f * (1f - pulse)), r * (0.26f + 0.08f * pulse), mic, style = Stroke(2.dp.toPx()))
-                }
-                CoreState.THINKING -> {
-                    val ir = r * 0.66f
-                    for (i in 0 until 3) {
-                        drawArc(
-                            Pal.Cyan.copy(alpha = 0.8f), fast + i * 120f, 50f, false,
-                            topLeft = Offset(c.x - ir, c.y - ir), size = Size(ir * 2, ir * 2),
-                            style = Stroke(3.dp.toPx(), cap = StrokeCap.Round)
-                        )
-                    }
-                }
-                else -> {}
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------- Home
-
-@Composable
-fun HomeScreen(requestPerms: () -> Unit, openSettings: () -> Unit) {
-    val ctx = LocalContext.current
-    val prefs = remember { Prefs(ctx) }
-    val state by AppState.core.collectAsState()
-    val online by AppState.online.collectAsState()
-    val running by AppState.serviceRunning.collectAsState()
-    val wake by AppState.wakeActive.collectAsState()
-    val heard by AppState.heard.collectAsState()
-    val status by AppState.status.collectAsState()
-    val messages by AppState.messages.collectAsState()
-    val visible by AppState.uiVisible.collectAsState()
-    val speechDl by AppState.speechDownload.collectAsState()
-    var wanted by remember(visible, running) { mutableStateOf(prefs.listeningWanted) }
-    val speechReady = remember(visible, speechDl) { Ears.isInstalled(ctx) }
-    val updateUrl by Updater.available.collectAsState()
-    val updateDl by Updater.progress.collectAsState()
-    val mode = remember(visible, online, running) { Assistant.mode(ctx) }
-
-    val talk: () -> Unit = {
-        when {
-            !Control.hasMic(ctx) -> requestPerms()
-            state == CoreState.SPEAKING -> Control.hush(ctx)
-            else -> Control.talk(ctx)
-        }
-    }
-    val toggleWake: () -> Unit = {
-        when {
-            wanted -> {
-                Control.stopListening(ctx)
-                wanted = false
-            }
-            !Control.hasMic(ctx) -> requestPerms()
-            !speechReady -> {
-                AppState.status.value = "Download the offline speech pack in Settings first (about 40 MB)."
-            }
-            else -> {
-                Control.startStandby(ctx)
-                wanted = true
-            }
-        }
-    }
-
-    Column(
-        Modifier.fillMaxSize().padding(horizontal = 20.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Spacer(Modifier.height(20.dp))
-        Text("A U R E L I S", color = Pal.Soft, fontSize = 22.sp, fontWeight = FontWeight.Light, letterSpacing = 5.sp)
-        Text("YOUR INTELLIGENCE. ALWAYS.", color = Pal.Cyan.copy(alpha = 0.75f), fontSize = 9.sp, letterSpacing = 3.sp)
-        Spacer(Modifier.height(12.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            StatusChip(if (online) "ONLINE" else "OFFLINE", if (online) Pal.Cyan else Pal.Amber)
-            StatusChip(
-                when (mode) {
-                    BrainMode.ONLINE -> "CLOUD AI"
-                    BrainMode.OFFLINE -> "LOCAL AI"
-                    BrainMode.LIMITED -> "LIMITED"
-                },
-                if (mode == BrainMode.LIMITED) Pal.Amber else Pal.Blue
-            )
-            StatusChip(if (running && wake) "LISTENING" else "MIC OFF", if (running && wake) Pal.Cyan else Pal.Silver)
-        }
-
-        AiCore(state, online, Modifier.fillMaxWidth().weight(1f), onTap = talk)
-
-        Text(
-            when {
-                state == CoreState.IDLE && !online -> "Offline mode"
-                else -> state.label
-            }.uppercase(),
-            color = if (state == CoreState.ERROR) Pal.Amber else Pal.Soft,
-            fontSize = 13.sp, letterSpacing = 2.sp, textAlign = TextAlign.Center
-        )
-        if (heard.isNotBlank() && state != CoreState.STANDBY) {
-            Text("“$heard”", color = Pal.Cyan.copy(alpha = 0.8f), fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-        }
-        if (status.isNotBlank()) {
-            Text(status, color = Pal.Amber, fontSize = 12.sp, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 4.dp))
-        }
-        if (speechDl >= 0) {
-            Text("Preparing hands-free listening… $speechDl%", color = Pal.Cyan, fontSize = 12.sp)
-        }
-        Spacer(Modifier.height(10.dp))
-
-        if (updateUrl != null) {
-            Card(
-                Modifier.fillMaxWidth().clickable { Updater.install(ctx) },
-                colors = CardDefaults.cardColors(containerColor = Pal.Blue.copy(alpha = 0.25f)),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Text(
-                    if (updateDl >= 0) "Downloading update… $updateDl%" else "UPDATE AVAILABLE · Tap to update AURELIS",
-                    color = Pal.Soft, fontSize = 12.sp, letterSpacing = 1.sp, modifier = Modifier.padding(14.dp)
-                )
-            }
-            Spacer(Modifier.height(10.dp))
-        }
-
-        val last = messages.lastOrNull { it.role == "assistant" }
-        if (last != null) {
-            Card(
-                Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Pal.Navy),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Text(last.text, color = Pal.Soft, fontSize = 13.sp, maxLines = 3, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(14.dp))
-            }
-            Spacer(Modifier.height(10.dp))
-        }
-
-        if ((!speechReady && speechDl < 0) || mode == BrainMode.LIMITED) {
-            Card(
-                Modifier.fillMaxWidth().clickable { openSettings() },
-                colors = CardDefaults.cardColors(containerColor = Pal.Navy),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(Modifier.padding(14.dp)) {
-                    Text("FINISH SETUP", color = Pal.Amber, fontSize = 11.sp, letterSpacing = 2.sp)
-                    if (!speechReady) Text("• Download the offline speech pack for \"Hey AURELIS\"", color = Pal.Soft, fontSize = 12.sp)
-                    if (mode == BrainMode.LIMITED) Text("• Add a cloud key or an offline brain", color = Pal.Soft, fontSize = 12.sp)
-                    Text("Tap to open Settings", color = Pal.Cyan, fontSize = 11.sp)
-                }
-            }
-            Spacer(Modifier.height(10.dp))
-        }
-
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(
-                onClick = toggleWake,
-                modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (wanted) Pal.Cyan else Pal.Navy,
-                    contentColor = if (wanted) Pal.Midnight else Pal.Cyan
-                )
-            ) { Text(if (wanted) "Hey AURELIS: ON" else "Hey AURELIS: OFF", fontSize = 12.sp) }
-            OutlinedButton(onClick = talk, modifier = Modifier.weight(1f)) {
-                Icon(if (state == CoreState.SPEAKING) Icons.Default.Stop else Icons.Default.Mic, null, tint = Pal.Cyan)
-                Spacer(Modifier.width(6.dp))
-                Text(if (state == CoreState.SPEAKING) "Stop" else "Talk", color = Pal.Cyan, fontSize = 12.sp)
-            }
-        }
-        Spacer(Modifier.height(12.dp))
     }
 }
 
