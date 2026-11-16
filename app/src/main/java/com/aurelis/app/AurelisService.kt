@@ -175,7 +175,7 @@ class AurelisService : Service() {
             then()
             return
         }
-        // The speech pack ships inside the app, so this works with no internet.
+        // Loads the downloaded wake-word pack from app storage (works with no internet once installed).
         scope.launch {
             val ok = withContext(Dispatchers.IO) { Ears.load(this@AurelisService) }
             if (!ok && wakeEnabled) {
@@ -213,6 +213,8 @@ class AurelisService : Service() {
         stopInterruptListener()
         google?.cancel()
         AppState.heard.value = ""
+        Capture.stop()
+        BargeIn.stop()
         if (wakeEnabled && Ears.isLoaded()) {
             enterStandby()
         } else {
@@ -279,6 +281,8 @@ class AurelisService : Service() {
     private fun activate(fromWake: Boolean) {
         handler.removeCallbacks(silence)
         Ears.stop()
+        Capture.stop()
+        BargeIn.stop()
         google?.cancel()
         Voice.stop()
         phase = Phase.GREETING
@@ -298,7 +302,7 @@ class AurelisService : Service() {
 
     private fun listenForCommand() {
         // Offline and the speech pack isn't in memory yet (e.g. it arrived after AURELIS started): load it first.
-        if (!AppState.online.value && !Ears.isLoaded() && Ears.isInstalled(this)) {
+        if (!AppState.online.value && !Whisper.ready(this) && !Ears.isLoaded() && Ears.isInstalled(this)) {
             phase = Phase.LISTENING
             loadEars { if (phase == Phase.LISTENING) listenForCommand() }
             return
@@ -310,6 +314,7 @@ class AurelisService : Service() {
         val googleOk = SpeechRecognizer.isRecognitionAvailable(this)
         when {
             AppState.online.value && prefs.googleSpeechOnline && googleOk -> listenGoogle()
+            Whisper.ready(this) -> listenWhisper(null)
             Ears.isLoaded() -> listenOffline()
             googleOk -> listenGoogle()
             else -> {
@@ -319,7 +324,88 @@ class AurelisService : Service() {
         }
     }
 
+    /** How many times in a row Whisper heard speech but no words (to ask once, then give up). */
+    private var emptyTries = 0
+
+    /**
+     * Offline command capture: Silero VAD waits for the user to finish (short pauses are fine),
+     * then Whisper tiny.en transcribes. [preRoll] is speech already heard during a barge-in.
+     */
+    private fun listenWhisper(preRoll: FloatArray?) {
+        handler.removeCallbacks(silence)
+        phase = Phase.LISTENING
+        AppState.core.value = CoreState.LISTENING
+        EarState.recognizer.value = "Whisper"
+        updateNotification("Listening…")
+        // Warm the model up while the user talks.
+        Bg.scope.launch { Whisper.load(this@AurelisService) }
+        val ok = Capture.start(
+            this, preRoll, waitMs = 8000,
+            onSpeech = { if (phase == Phase.LISTENING) AppState.heard.value = "…" },
+            onDone = done@{ samples ->
+                if (phase != Phase.LISTENING) return@done
+                if (samples == null) {
+                    emptyTries = 0
+                    endConversation()
+                    return@done
+                }
+                phase = Phase.THINKING
+                AppState.core.value = CoreState.THINKING
+                AppState.heard.value = "Understanding…"
+                scope.launch {
+                    val text = withContext(Dispatchers.IO) { Whisper.transcribe(this@AurelisService, samples) }
+                    if (phase != Phase.THINKING) return@launch
+                    when {
+                        text == null -> {
+                            // Never drop what the user said silently: tell them and switch recogniser.
+                            phase = Phase.SPEAKING
+                            AppState.core.value = CoreState.SPEAKING
+                            Voice.speak("I heard you, but my offline transcriber failed. Please say that again.") {
+                                if (phase != Phase.SPEAKING) return@speak
+                                if (Ears.isLoaded()) {
+                                    phase = Phase.LISTENING
+                                    AppState.core.value = CoreState.LISTENING
+                                    listenOffline()
+                                } else {
+                                    rest()
+                                }
+                            }
+                        }
+                        text.isBlank() -> {
+                            phase = Phase.SPEAKING
+                            AppState.core.value = CoreState.SPEAKING
+                            if (emptyTries++ < 1) {
+                                Voice.speak("Sorry, I didn't catch that. Please say it again.") {
+                                    if (phase == Phase.SPEAKING) listenForCommand()
+                                }
+                            } else {
+                                emptyTries = 0
+                                Voice.speak("I still couldn't make that out. Call me when you're ready.") {
+                                    if (phase == Phase.SPEAKING) rest()
+                                }
+                            }
+                        }
+                        else -> {
+                            emptyTries = 0
+                            process(text)
+                        }
+                    }
+                }
+            },
+            onFail = { msg ->
+                AppState.status.value = "Microphone: $msg"
+                if (phase == Phase.LISTENING) {
+                    if (Ears.isLoaded()) listenOffline() else endConversation()
+                }
+            }
+        )
+        if (!ok && phase == Phase.LISTENING) {
+            if (Ears.isLoaded()) listenOffline() else endConversation()
+        }
+    }
+
     private fun listenOffline() {
+        EarState.recognizer.value = "Vosk"
         handler.removeCallbacks(silence)
         handler.postDelayed(silence, 9000)
         val ok = Ears.start(
@@ -343,6 +429,7 @@ class AurelisService : Service() {
     }
 
     private fun listenGoogle() {
+        EarState.recognizer.value = "Google"
         handler.removeCallbacks(silence)
         val rec = google ?: SpeechRecognizer.createSpeechRecognizer(this).also { google = it }
         rec.setRecognitionListener(object : RecognitionListener {
@@ -374,7 +461,11 @@ class AurelisService : Service() {
                 when (error) {
                     // No internet, or no offline language pack for Google's recogniser: use our own offline one.
                     SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT, SpeechRecognizer.ERROR_SERVER, 12, 13 ->
-                        if (Ears.isLoaded()) listenOffline() else endConversation()
+                        when {
+                            Whisper.ready(this@AurelisService) -> listenWhisper(null)
+                            Ears.isLoaded() -> listenOffline()
+                            else -> endConversation()
+                        }
                     else -> endConversation()
                 }
             }
@@ -388,7 +479,11 @@ class AurelisService : Service() {
         try {
             rec.startListening(intent)
         } catch (e: Exception) {
-            if (Ears.isLoaded()) listenOffline() else endConversation()
+            when {
+                Whisper.ready(this) -> listenWhisper(null)
+                Ears.isLoaded() -> listenOffline()
+                else -> endConversation()
+            }
         }
     }
 
@@ -416,12 +511,27 @@ class AurelisService : Service() {
         Voice.speak(reply.text) {
             stopInterruptListener()
             if (phase != Phase.SPEAKING) return@speak
-            if (reply.end) rest() else listenForCommand()
+            // Single-command mode goes back to standby, unless AURELIS has just asked something.
+            val asked = reply.text.trimEnd().endsWith("?") || reply.text.contains("yes or no", ignoreCase = true)
+            if (reply.end || (!VoicePrefs.continuous(this) && !asked)) rest() else listenForCommand()
         }
     }
 
-    /** While speaking, "Hey AURELIS" interrupts and AURELIS listens again. */
+    /**
+     * While speaking: talking over AURELIS interrupts it (voice detector + echo canceller).
+     * Without the voice detector, "Hey AURELIS" interrupts instead.
+     */
     private fun startInterruptListener() {
+        if (BargeIn.available(this) && Control.hasMic(this)) {
+            val started = BargeIn.start(this) { heard ->
+                if (phase != Phase.SPEAKING) return@start
+                Voice.stop()
+                BargeIn.stop()
+                quietSince = 0L
+                if (Whisper.ready(this)) listenWhisper(heard) else listenForCommand()
+            }
+            if (started) return
+        }
         if (!Ears.isLoaded()) return
         val variants = WakeWord.variants(prefs)
         Ears.start(
@@ -439,12 +549,14 @@ class AurelisService : Service() {
     }
 
     private fun stopInterruptListener() {
+        BargeIn.stop()
         if (phase != Phase.STANDBY && phase != Phase.LISTENING) Ears.stop()
     }
 
     private fun endConversation() {
         handler.removeCallbacks(silence)
         Ears.stop()
+        Capture.stop()
         rest()
     }
 
@@ -487,6 +599,8 @@ class AurelisService : Service() {
         AppState.core.value = CoreState.IDLE
         handler.removeCallbacksAndMessages(null)
         Ears.stop()
+        Capture.stop()
+        BargeIn.stop()
         google?.destroy()
         google = null
         wakeLock?.let { if (it.isHeld) it.release() }
