@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AURELIS core: blue halo, silver ring, amber orbit, cyan centre with an A -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#00000000" android:strokeColor="#167BFF" android:strokeWidth="3"
+        android:pathData="M54,27 A27,27 0 1,1 53.99,27 Z" />
+    <path android:fillColor="#00000000" android:strokeColor="#C7D2DC" android:strokeWidth="2"
+        android:pathData="M54,32 A22,22 0 1,1 53.99,32 Z" />
+    <path android:fillColor="#00000000" android:strokeColor="#00D9FF" android:strokeWidth="1.5"
+        android:pathData="M54,37 A17,17 0 1,1 53.99,37 Z" />
+    <path android:fillColor="#FFB52E" android:pathData="M78,40 A2.5,2.5 0 1,1 77.99,40 Z" />
+    <path android:fillColor="#0C1525" android:pathData="M54,40 A14,14 0 1,1 53.99,40 Z" />
+    <path android:fillColor="#00000000" android:strokeColor="#D5E8F5" android:strokeWidth="2.5"
+        android:strokeLineJoin="round" android:strokeLineCap="round"
+        android:pathData="M47,63 L54,44 L61,63 M49.5,57 L58.5,57" />
+</vector>
