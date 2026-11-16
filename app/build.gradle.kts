@@ -1,3 +1,5 @@
+import java.io.File
+import java.net.URL
 import java.util.Base64
 
 plugins {
@@ -53,6 +55,26 @@ artSource?.let { src ->
     )
 }
 
+// Offline speech built in: the build machine downloads the English speech pack once and packs it
+// into the app, so listening works offline from the first launch with nothing to download.
+val voskZip = rootProject.file(".cache/vosk-model-small-en-us-0.15.zip")
+if (!voskZip.exists() || voskZip.length() < 30_000_000L) {
+    voskZip.parentFile.mkdirs()
+    try {
+        val part = File(voskZip.path + ".part")
+        URL("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip").openStream().use { input ->
+            part.outputStream().use { input.copyTo(it) }
+        }
+        if (part.length() > 30_000_000L) part.renameTo(voskZip) else part.delete()
+    } catch (e: Exception) {
+        println("AURELIS: couldn't download the offline speech pack: " + e.message)
+    }
+}
+val speechAssets = layout.buildDirectory.dir("generated/aurelisAssets").get().asFile
+speechAssets.deleteRecursively()
+speechAssets.mkdirs()
+if (voskZip.exists()) voskZip.copyTo(speechAssets.resolve("vosk-model.zip"), overwrite = true)
+
 android {
     namespace = "com.aurelis.app"
     compileSdk = 35
@@ -63,7 +85,7 @@ android {
         targetSdk = 35
         // Minutes since 1970: always increases, so newer builds always count as updates.
         versionCode = (buildTime / 60_000L).toInt()
-        versionName = "1.3"
+        versionName = "2.0"
         manifestPlaceholders["appIcon"] = if (artSource != null) "@mipmap/ic_launcher_art" else "@mipmap/ic_launcher"
         buildConfigField("long", "BUILD_TIME", "${buildTime}L")
         ndk {
@@ -83,6 +105,10 @@ android {
     }
 
     sourceSets["main"].res.srcDir(artRes)
+    sourceSets["main"].assets.srcDir(speechAssets)
+    androidResources {
+        noCompress += "zip"
+    }
 
     buildTypes {
         release {
