@@ -175,16 +175,36 @@ class AurelisService : Service() {
             then()
             return
         }
-        if (!Ears.isInstalled(this)) {
-            if (wakeEnabled) AppState.status.value = "Download the offline speech pack in Settings to enable \"Hey AURELIS\"."
-            then()
-            return
-        }
+        // The speech pack ships inside the app, so this works with no internet.
         scope.launch {
             val ok = withContext(Dispatchers.IO) { Ears.load(this@AurelisService) }
-            if (!ok) AppState.status.value = "The offline speech pack couldn't be loaded. Try re-downloading it in Settings."
+            if (!ok && wakeEnabled) {
+                AppState.status.value = if (!Ears.isInstalled(this@AurelisService))
+                    "Offline speech isn't installed. Open Settings to download it once (about 40 MB)."
+                else "The offline speech pack couldn't be loaded. Try re-downloading it in Settings."
+            }
             then()
         }
+    }
+
+    /** When AURELIS last finished speaking or woke, so its own voice and echoes are ignored. */
+    private var quietSince = 0L
+
+    /**
+     * Open listening hears everything in the room. Only act on speech that sounds like a clear
+     * command to AURELIS: short, confident, and starting like an instruction or a greeting.
+     */
+    private fun accept(t: String): Boolean {
+        if (!Speech.meaningful(t)) return false
+        if (System.currentTimeMillis() - quietSince < 1500) return false
+        val words = WakeWord.norm(t).split(" ").filter { it.isNotEmpty() }
+        if (words.isEmpty() || words.size > 16) return false
+        val first = words[0]
+        val commandish = Skills.commandLike(t) || first in Actions.VERBS ||
+            first in setOf("hello", "hi", "hey", "aurelis", "please", "can", "could", "who", "when", "where", "why", "tell")
+        if (!commandish) return false
+        val need = Tune.threshold(this)
+        return Ears.lastConfidence >= need || (words.size <= 3 && Ears.lastConfidence >= need - 0.08f)
     }
 
     /** Nothing to do: wait for the wake word, or shut down if continuous listening is off. */
@@ -204,6 +224,7 @@ class AurelisService : Service() {
     }
 
     private fun enterStandby() {
+        quietSince = System.currentTimeMillis()
         phase = Phase.STANDBY
         AppState.core.value = CoreState.STANDBY
         AppState.wakeActive.value = true
@@ -212,7 +233,9 @@ class AurelisService : Service() {
         val open = Opt.openListening(this)
         updateNotification(if (open) "Listening · just speak to me" else "Standby · say \"Hey AURELIS\" or clap twice")
         val variants = WakeWord.variants(prefs)
-        val onClap: (() -> Unit)? = if (Opt.clap(this)) ({ if (phase == Phase.STANDBY) onWake() }) else null
+        val onClap: (() -> Unit)? = if (Opt.clap(this)) ({
+            if (phase == Phase.STANDBY && System.currentTimeMillis() - quietSince > 1500) onWake()
+        }) else null
         val started = Ears.start(
             onPartial = { t ->
                 AppState.heard.value = t
@@ -224,7 +247,7 @@ class AurelisService : Service() {
                     val words = WakeWord.norm(t).split(" ").count { it.isNotEmpty() }
                     if (WakeWord.detect(t, variants) && (!open || words <= 3)) {
                         onWake()
-                    } else if (open && Speech.meaningful(t)) {
+                    } else if (open && accept(t)) {
                         Ears.stop()
                         AppState.wakeActive.value = false
                         // Drop a leading "Hey AURELIS" so the command itself is what gets understood.
@@ -262,7 +285,8 @@ class AurelisService : Service() {
         AppState.core.value = CoreState.WAKE
         AppState.wakeActive.value = false
         updateNotification("Activated")
-        if (fromWake) bringToFront()
+        // Don't jump in front of an app the user is working in; screen commands act on that app.
+        if (fromWake && !Actions.busyInApp(this)) bringToFront()
         handler.postDelayed({
             if (phase != Phase.GREETING) return@postDelayed
             AppState.core.value = CoreState.SPEAKING
@@ -273,6 +297,12 @@ class AurelisService : Service() {
     }
 
     private fun listenForCommand() {
+        // Offline and the speech pack isn't in memory yet (e.g. it arrived after AURELIS started): load it first.
+        if (!AppState.online.value && !Ears.isLoaded() && Ears.isInstalled(this)) {
+            phase = Phase.LISTENING
+            loadEars { if (phase == Phase.LISTENING) listenForCommand() }
+            return
+        }
         phase = Phase.LISTENING
         AppState.core.value = CoreState.LISTENING
         AppState.heard.value = ""
@@ -318,9 +348,13 @@ class AurelisService : Service() {
         rec.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {}
             override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onRmsChanged(rmsdB: Float) {
+                Levels.mic.value = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
+            }
             override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
+            override fun onEndOfSpeech() {
+                Levels.mic.value = 0f
+            }
             override fun onEvent(eventType: Int, params: Bundle?) {}
 
             override fun onPartialResults(partialResults: Bundle?) {
@@ -336,8 +370,10 @@ class AurelisService : Service() {
 
             override fun onError(error: Int) {
                 if (phase != Phase.LISTENING) return
+                Levels.mic.value = 0f
                 when (error) {
-                    SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT, SpeechRecognizer.ERROR_SERVER ->
+                    // No internet, or no offline language pack for Google's recogniser: use our own offline one.
+                    SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT, SpeechRecognizer.ERROR_SERVER, 12, 13 ->
                         if (Ears.isLoaded()) listenOffline() else endConversation()
                     else -> endConversation()
                 }
@@ -347,6 +383,7 @@ class AurelisService : Service() {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            if (!AppState.online.value) putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
         }
         try {
             rec.startListening(intent)
