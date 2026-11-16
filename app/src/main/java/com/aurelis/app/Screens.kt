@@ -490,6 +490,8 @@ fun SettingsScreen(requestPerms: () -> Unit) {
             }
         }
 
+        VoiceUpgradeSections()
+
         Section("OFFLINE BRAIN (LOCAL AI)") {
             Text(
                 "Runs a small AI model on your phone so AURELIS can chat without internet. Your phone has about $ramGb GB RAM. Download over Wi-Fi.",

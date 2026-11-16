@@ -149,9 +149,13 @@ object Control {
         preparing = true
         Bg.scope.launch {
             try {
-                // The speech pack is built into the app; only very old builds need to download it.
+                // The wake-word pack is downloaded once (it is no longer packed into the app, to keep it small)
+                // and stays installed across updates.
                 if (!Ears.installFromApp(app)) {
-                    if (!AppState.online.value) return@launch
+                    if (!AppState.online.value) {
+                        AppState.status.value = "Connect to the internet once so I can download my wake-word pack (about ${Ears.MODEL_MB} MB)."
+                        return@launch
+                    }
                     Ears.install(app)
                 }
                 withContext(Dispatchers.Main) { ensureListening(app) }

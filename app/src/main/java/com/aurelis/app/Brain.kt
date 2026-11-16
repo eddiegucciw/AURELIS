@@ -99,6 +99,14 @@ object LocalBrain {
     private var llm: LlmInference? = null
     private var loadedId: String? = null
 
+    // Frees the model's memory (often 1 GB or more) when AURELIS hasn't used it for a while.
+    private const val IDLE_MS = 5 * 60_000L
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+    private val idle = Runnable { Thread { close() }.start() }
+
+    /** True while the model is in memory (for the status screen). */
+    fun loaded() = llm != null
+
     fun file(ctx: Context, m: LocalModel) = File(File(ctx.filesDir, "models"), m.file)
 
     fun installed(ctx: Context) = MODELS.filter { file(ctx, it).exists() }
@@ -157,7 +165,9 @@ object LocalBrain {
     /** Blocking. Returns null if no local model could run. */
     @Synchronized
     fun generate(ctx: Context, system: String, history: List<Msg>, user: String): String? {
+        main.removeCallbacks(idle)
         if (!ensureLoaded(ctx)) return null
+        main.postDelayed(idle, IDLE_MS)
         val sb = StringBuilder()
         sb.append("<|im_start|>system\n").append(system).append("<|im_end|>\n")
         history.takeLast(4).forEach { m ->
