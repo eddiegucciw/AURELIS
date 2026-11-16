@@ -47,6 +47,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -66,12 +69,17 @@ object Pal {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Hands-free is on by default; it only stays off if the user switched it off.
+        val sp = getSharedPreferences("aurelis", Context.MODE_PRIVATE)
+        if (!sp.contains("listening_wanted")) Prefs(this).listeningWanted = true
         setContent { AurelisRoot() }
     }
 
     override fun onResume() {
         super.onResume()
         AppState.uiVisible.value = true
+        Control.ensureListening(this)
+        Updater.check()
     }
 
     override fun onPause() {
@@ -97,6 +105,35 @@ object Control {
         send(ctx, AurelisService.ACTION_START)
     }
 
+    @Volatile
+    private var preparing = false
+
+    /**
+     * Always-listening by default: starts "Hey AURELIS" standby without any button press,
+     * downloading the offline speech pack first if it is missing.
+     */
+    fun ensureListening(ctx: Context) {
+        val app = ctx.applicationContext
+        val prefs = Prefs(app)
+        if (!prefs.listeningWanted || !hasMic(app) || AurelisService.running) return
+        if (Ears.isInstalled(app)) {
+            if (AppState.uiVisible.value) startStandby(app)
+            return
+        }
+        if (preparing || !AppState.online.value || AppState.speechDownload.value >= 0) return
+        preparing = true
+        Bg.scope.launch {
+            try {
+                Ears.install(app)
+                withContext(Dispatchers.Main) { ensureListening(app) }
+            } catch (e: Exception) {
+                AppState.status.value = "Couldn't download the speech pack. Check your internet, then reopen AURELIS."
+            } finally {
+                preparing = false
+            }
+        }
+    }
+
     fun stopListening(ctx: Context) {
         Prefs(ctx).listeningWanted = false
         if (AurelisService.running) {
@@ -116,7 +153,12 @@ object Control {
 fun AurelisRoot() {
     val ctx = LocalContext.current
     var tab by rememberSaveable { mutableIntStateOf(0) }
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        Control.ensureListening(ctx)
+    }
+    val speechProgress by AppState.speechDownload.collectAsState()
+    // When the speech pack finishes downloading (from anywhere), start listening straight away.
+    LaunchedEffect(speechProgress) { if (speechProgress < 0) Control.ensureListening(ctx) }
     val requestPerms: () -> Unit = {
         val need = mutableListOf<String>()
         if (!Control.hasMic(ctx)) need += Manifest.permission.RECORD_AUDIO
@@ -339,8 +381,10 @@ fun HomeScreen(requestPerms: () -> Unit, openSettings: () -> Unit) {
     val messages by AppState.messages.collectAsState()
     val visible by AppState.uiVisible.collectAsState()
     val speechDl by AppState.speechDownload.collectAsState()
-    var wanted by remember { mutableStateOf(prefs.listeningWanted) }
+    var wanted by remember(visible, running) { mutableStateOf(prefs.listeningWanted) }
     val speechReady = remember(visible, speechDl) { Ears.isInstalled(ctx) }
+    val updateUrl by Updater.available.collectAsState()
+    val updateDl by Updater.progress.collectAsState()
     val mode = remember(visible, online, running) { Assistant.mode(ctx) }
 
     val talk: () -> Unit = {
@@ -404,7 +448,24 @@ fun HomeScreen(requestPerms: () -> Unit, openSettings: () -> Unit) {
         if (status.isNotBlank()) {
             Text(status, color = Pal.Amber, fontSize = 12.sp, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 4.dp))
         }
+        if (speechDl >= 0) {
+            Text("Preparing hands-free listening… $speechDl%", color = Pal.Cyan, fontSize = 12.sp)
+        }
         Spacer(Modifier.height(10.dp))
+
+        if (updateUrl != null) {
+            Card(
+                Modifier.fillMaxWidth().clickable { Updater.install(ctx) },
+                colors = CardDefaults.cardColors(containerColor = Pal.Blue.copy(alpha = 0.25f)),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text(
+                    if (updateDl >= 0) "Downloading update… $updateDl%" else "UPDATE AVAILABLE · Tap to update AURELIS",
+                    color = Pal.Soft, fontSize = 12.sp, letterSpacing = 1.sp, modifier = Modifier.padding(14.dp)
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+        }
 
         val last = messages.lastOrNull { it.role == "assistant" }
         if (last != null) {
@@ -418,7 +479,7 @@ fun HomeScreen(requestPerms: () -> Unit, openSettings: () -> Unit) {
             Spacer(Modifier.height(10.dp))
         }
 
-        if (!speechReady || mode == BrainMode.LIMITED) {
+        if ((!speechReady && speechDl < 0) || mode == BrainMode.LIMITED) {
             Card(
                 Modifier.fillMaxWidth().clickable { openSettings() },
                 colors = CardDefaults.cardColors(containerColor = Pal.Navy),
