@@ -14,6 +14,34 @@ signingKeystore.writeBytes(Base64.getMimeDecoder().decode(rootProject.file("sign
 
 val buildTime = System.currentTimeMillis()
 
+// Optional artwork: a picture uploaded to the top folder of the repo becomes the app icon
+// and the centre of the Home screen.
+val artSource = rootProject.projectDir.listFiles()
+    ?.filter { it.isFile && it.extension.lowercase() in listOf("png", "jpg", "jpeg", "webp") }
+    ?.maxByOrNull { it.length() }
+val artRes = layout.buildDirectory.dir("generated/aurelisArt/res").get().asFile
+artRes.deleteRecursively()
+artRes.mkdirs()
+artSource?.let { src ->
+    src.copyTo(artRes.resolve("drawable-nodpi/aurelis_art." + src.extension.lowercase()), overwrite = true)
+    artRes.resolve("drawable").mkdirs()
+    artRes.resolve("drawable/aurelis_art_fg.xml").writeText(
+        """<?xml version="1.0" encoding="utf-8"?>
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/aurelis_art" android:inset="16dp" />
+"""
+    )
+    artRes.resolve("mipmap-anydpi-v26").mkdirs()
+    artRes.resolve("mipmap-anydpi-v26/ic_launcher_art.xml").writeText(
+        """<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/icon_background" />
+    <foreground android:drawable="@drawable/aurelis_art_fg" />
+</adaptive-icon>
+"""
+    )
+}
+
 android {
     namespace = "com.aurelis.app"
     compileSdk = 35
@@ -24,8 +52,9 @@ android {
         targetSdk = 35
         // Minutes since 1970: always increases, so newer builds always count as updates.
         versionCode = (buildTime / 60_000L).toInt()
-        versionName = "1.1"
+        versionName = "1.2"
         buildConfigField("long", "BUILD_TIME", "${buildTime}L")
+        manifestPlaceholders["appIcon"] = if (artSource != null) "@mipmap/ic_launcher_art" else "@mipmap/ic_launcher"
         ndk {
             // Modern phones only; keeps the APK smaller.
             abiFilters += listOf("arm64-v8a")
@@ -41,6 +70,8 @@ android {
             keyPassword = "android"
         }
     }
+
+    sourceSets["main"].res.srcDir(artRes)
 
     buildTypes {
         release {
