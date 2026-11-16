@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.media.AudioManager
 import android.net.Uri
 import android.os.BatteryManager
 import android.provider.AlarmClock
@@ -38,6 +39,12 @@ sealed class Cmd {
     data class Sms(val number: String, val message: String) : Cmd()
     object ReadClipboard : Cmd()
     object Status : Cmd()
+    data class Volume(val action: String, val percent: Int?) : Cmd()
+    object ShowAlarms : Cmd()
+    data class DeleteReminder(val query: String) : Cmd()
+    object ClearReminders : Cmd()
+    data class Teach(val trigger: String, val meaning: String) : Cmd()
+    object ScreenControl : Cmd()
     object StopListening : Cmd()
     object Goodbye : Cmd()
 }
@@ -127,7 +134,7 @@ object Intents {
         return c.timeInMillis
     }
 
-    private fun category(content: String): String {
+    fun category(content: String): String {
         val c = content.lowercase(Locale.ROOT)
         return when {
             Regex("favou?rite|i like|i love|i prefer|i hate|i don't like|call me").containsMatchIn(c) -> MemoryCategory.PREFERENCES
@@ -145,7 +152,34 @@ object Intents {
         if (n in GOODBYES) return Cmd.Goodbye
         if (Regex("^(stop|pause) listening|^go to sleep|^stand down").containsMatchIn(n)) return Cmd.StopListening
 
+        // Teaching a shortcut
+        Regex("^(?:when|whenever|if) i say (.+?) (?:i mean|it means|you should|then) (.+)$").find(n)?.let {
+            return Cmd.Teach(it.groupValues[1], it.groupValues[2])
+        }
+
+        // Volume
+        if (Regex("\\bvolume\\b|\\blouder\\b|\\bquieter\\b|^mute\\b|^unmute\\b").containsMatchIn(n)) {
+            val pct = Regex("\\b(\\d{1,3})\\b").find(d)?.groupValues?.get(1)?.toIntOrNull()
+            return when {
+                n.contains("unmute") -> Cmd.Volume("unmute", null)
+                Regex("\\bmute\\b|silent").containsMatchIn(n) -> Cmd.Volume("mute", null)
+                Regex("\\bmax|\\bfull\\b|highest").containsMatchIn(n) -> Cmd.Volume("max", null)
+                pct != null -> Cmd.Volume("set", pct.coerceIn(0, 100))
+                Regex("\\bup\\b|increase|raise|louder|higher|more").containsMatchIn(n) -> Cmd.Volume("up", null)
+                Regex("down|decrease|lower|reduce|quieter|less").containsMatchIn(n) -> Cmd.Volume("down", null)
+                else -> Cmd.Volume("status", null)
+            }
+        }
+
+        // Alarms in the Clock app, and other apps' screens
+        if (Regex("(show|open|see|view|browse|list|check|read|delete|remove|cancel|edit|change|what are) (?:me )?(?:all )?(?:my |the |an? )?alarms?\\b|^my alarms$").containsMatchIn(n)) return Cmd.ShowAlarms
+        if (Regex("^scroll (up|down)|^swipe |^go back$").containsMatchIn(n)) return Cmd.ScreenControl
+
         // Reminders
+        if (Regex("^(?:delete|cancel|clear|remove) all (?:my |the )?reminders$").containsMatchIn(n)) return Cmd.ClearReminders
+        Regex("^(?:delete|cancel|remove) (?:my |the )?reminder (?:to |about |for )?(.+)$").find(n)?.let {
+            return Cmd.DeleteReminder(it.groupValues[1])
+        }
         Regex("^(?:please )?(?:remind me|set a reminder|reminder)(?: to)? (.+?) in $DUR$").find(d)?.let {
             return Cmd.Remind(it.groupValues[1], System.currentTimeMillis() + durationMs(it.groupValues[2]))
         }
@@ -226,6 +260,10 @@ object Intents {
         "add_task" -> Cmd.AddTask(a.optString("title"))
         "list_tasks" -> Cmd.ListTasks
         "read_notifications" -> Cmd.ReadNotifications
+        "show_alarms" -> Cmd.ShowAlarms
+        "volume" ->
+            if (a.has("percent")) Cmd.Volume("set", a.optInt("percent").coerceIn(0, 100))
+            else Cmd.Volume(a.optString("direction", "status"), null)
         "dial" -> Cmd.Dial(a.optString("number"))
         "sms" -> Cmd.Sms(a.optString("number"), a.optString("message"))
         else -> null
@@ -295,6 +333,30 @@ object Device {
         return String.format(Locale.ROOT, "Alarm set for %02d:%02d.", hour, minute)
     }
 
+    fun volume(ctx: Context, action: String, percent: Int?): String {
+        val am = ctx.getSystemService(AudioManager::class.java)
+        val s = AudioManager.STREAM_MUSIC
+        val max = am.getStreamMaxVolume(s)
+        val ui = AudioManager.FLAG_SHOW_UI
+        when (action) {
+            "up" -> repeat(2) { am.adjustStreamVolume(s, AudioManager.ADJUST_RAISE, ui) }
+            "down" -> repeat(2) { am.adjustStreamVolume(s, AudioManager.ADJUST_LOWER, ui) }
+            "mute" -> am.adjustStreamVolume(s, AudioManager.ADJUST_MUTE, ui)
+            "unmute" -> am.adjustStreamVolume(s, AudioManager.ADJUST_UNMUTE, ui)
+            "max" -> am.setStreamVolume(s, max, ui)
+            "set" -> am.setStreamVolume(s, (max * (percent ?: 50) / 100).coerceIn(0, max), ui)
+        }
+        if (action == "mute") return "Muted."
+        return "Volume is at ${am.getStreamVolume(s) * 100 / max} percent."
+    }
+
+    fun showAlarms(ctx: Context): Boolean = try {
+        ctx.startActivity(Intent(AlarmClock.ACTION_SHOW_ALARMS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        true
+    } catch (e: Exception) {
+        false
+    }
+
     fun webSearch(ctx: Context, q: String): String {
         ctx.startActivity(
             Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(q)))
@@ -356,12 +418,54 @@ object Assistant {
         } catch (e: Throwable) {
             Reply("Something went wrong while I was working on that. ${e.message ?: ""}".trim())
         }
+        try {
+            learn(text)
+        } catch (e: Throwable) {
+            // Learning is best-effort.
+        }
         record(ctx, "assistant", reply.text)
         reply
     }
 
-    private suspend fun think(ctx: Context, text: String): Reply {
-        val n = Intents.norm(text)
+    private val PERSONAL = Regex(
+        "\\b(my name is|call me|i am an?|i'm an?|i am from|i'm from|i live|i work|i study|i like|i love|i hate|i prefer|" +
+            "i don't like|i was born|i usually|i always|i never|my (favou?rite|wife|husband|girlfriend|boyfriend|mum|mom|" +
+            "mother|dad|father|brother|sister|son|daughter|friend|boss|birthday|job|car|school|church|business|company|" +
+            "name|age|home|house|office|doctor|teacher))\\b",
+        RegexOption.IGNORE_CASE
+    )
+    private val NOT_A_FACT = Regex(
+        "^(what|who|how|why|when|where|which|can|could|do|does|did|is|are|will|would|should|tell|show|open|set|remind|add|play)\\b",
+        RegexOption.IGNORE_CASE
+    )
+    private val TAUGHT = Regex("^When I say \"(.+)\", I mean \"(.+)\"$")
+
+    /** Self-learning: quietly keeps lasting facts the user mentions about themselves. */
+    private suspend fun learn(said: String) {
+        val app = AurelisApp.instance
+        if (!app.prefs.useMemory) return
+        val t = said.trim().trimEnd('.', '!')
+        if (t.length !in 8..160 || t.endsWith("?") || NOT_A_FACT.containsMatchIn(t)) return
+        if (!PERSONAL.containsMatchIn(t) || Intents.parse(t) != null) return
+        val n = Intents.norm(t)
+        if (app.db.memories().list().any { Intents.norm(it.content) == n }) return
+        app.db.memories().insert(Memory(category = Intents.category(t), content = t))
+        log("Learned from conversation: $t")
+    }
+
+    /** Shortcuts the user taught with "when I say X, I mean Y". */
+    private suspend fun applyTaught(said: String): String {
+        val n = Intents.norm(said)
+        for (m in AurelisApp.instance.db.memories().list()) {
+            if (m.category != MemoryCategory.LEARNING) continue
+            val g = TAUGHT.find(m.content)?.groupValues ?: continue
+            if (Intents.norm(g[1]) == n) return g[2]
+        }
+        return said
+    }
+
+    private suspend fun think(ctx: Context, input: String): Reply {
+        val n = Intents.norm(input)
 
         // 1. Waiting for a yes/no on a sensitive action?
         pending?.let { p ->
@@ -369,6 +473,8 @@ object Assistant {
             if (n in YES) return run(ctx, p, confirmed = true)
             if (n in NO) return Reply("Cancelled. Nothing was changed.")
         }
+
+        val text = applyTaught(input)
 
         // 2. Commands we can understand locally and reliably.
         Intents.parse(text)?.let { return run(ctx, it, confirmed = false) }
@@ -445,6 +551,9 @@ object Assistant {
               {"action":"web_search","query":"..."}
               {"action":"torch_on"} / {"action":"torch_off"} / {"action":"battery"}
               {"action":"read_notifications"}
+              {"action":"show_alarms"}
+              {"action":"volume","direction":"up"}   (up, down, mute, unmute or max)
+              {"action":"volume","percent":40}
               {"action":"dial","number":"..."}
               {"action":"sms","number":"...","message":"..."}
             Otherwise answer normally.
@@ -462,6 +571,7 @@ object Assistant {
     private fun confirmText(c: Cmd): String? = when (c) {
         is Cmd.Forget -> "Shall I delete memories about \"${c.query}\"? Say yes or no."
         is Cmd.Dial -> "Shall I open the dialler for ${c.number}? Say yes or no."
+        Cmd.ClearReminders -> "Shall I delete all your reminders? Say yes or no."
         is Cmd.Sms -> "Shall I prepare a message to ${c.number} saying \"${c.message}\"? Say yes or no."
         else -> null
     }
@@ -541,6 +651,41 @@ object Assistant {
                     log("Task completed: ${t.title}")
                     Reply("Marked done: ${t.title}.")
                 }
+            }
+            is Cmd.Volume -> withContext(Dispatchers.Main) { Reply(Device.volume(ctx, c.action, c.percent)) }
+            Cmd.ShowAlarms -> withContext(Dispatchers.Main) {
+                if (Device.showAlarms(ctx)) Reply(
+                    "I've opened your alarms. Android doesn't let any app delete Clock alarms directly, so tap the one you want to change.",
+                    end = true, leftApp = true
+                ) else Reply("I couldn't open the Clock app on this phone.")
+            }
+            Cmd.ScreenControl -> Reply("I can't scroll or tap inside other apps yet. That needs Android's accessibility permission, which this version doesn't use.")
+            Cmd.ClearReminders -> {
+                val list = app.db.reminders().pending()
+                list.forEach {
+                    Reminders.cancel(ctx, it)
+                    app.db.reminders().delete(it)
+                }
+                log("Deleted all reminders (${list.size})")
+                Reply(if (list.isEmpty()) "You had no reminders." else "Done. I've deleted ${list.size} reminder${if (list.size > 1) "s" else ""}.")
+            }
+            is Cmd.DeleteReminder -> {
+                val words = Intents.norm(c.query).split(" ").filter { it.length > 2 }
+                val hits = app.db.reminders().pending().filter { r ->
+                    val rn = Intents.norm(r.text)
+                    words.isNotEmpty() && words.all { rn.contains(it) }
+                }
+                hits.forEach {
+                    Reminders.cancel(ctx, it)
+                    app.db.reminders().delete(it)
+                }
+                if (hits.isNotEmpty()) log("Deleted reminder: ${hits.joinToString { it.text }}")
+                Reply(if (hits.isEmpty()) "I couldn't find a reminder about ${c.query}." else "Done. I've deleted the reminder: ${hits.joinToString(", ") { it.text }}.")
+            }
+            is Cmd.Teach -> {
+                app.db.memories().insert(Memory(category = MemoryCategory.LEARNING, content = "When I say \"${c.trigger}\", I mean \"${c.meaning}\""))
+                log("Learned shortcut: ${c.trigger} = ${c.meaning}")
+                Reply("Learned. When you say ${c.trigger}, I'll treat it as ${c.meaning}.")
             }
             Cmd.ReadNotifications -> Reply(NotificationReader.summary(ctx))
             is Cmd.OpenApp -> withContext(Dispatchers.Main) {
