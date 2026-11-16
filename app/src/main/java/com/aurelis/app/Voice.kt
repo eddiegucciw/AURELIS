@@ -1,6 +1,10 @@
 package com.aurelis.app
 
+import android.annotation.SuppressLint
 import android.content.Context
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
@@ -10,8 +14,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
-import org.vosk.android.RecognitionListener
-import org.vosk.android.SpeechService
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -260,7 +262,9 @@ object Ears {
     const val MODEL_MB = 40
 
     private var model: Model? = null
-    private var service: SpeechService? = null
+    private var thread: Thread? = null
+    @Volatile private var runId = 0
+    private val main = Handler(Looper.getMainLooper())
 
     fun modelDir(ctx: Context) = File(ctx.filesDir, MODEL_NAME)
 
@@ -301,59 +305,99 @@ object Ears {
         }
     }
 
-    /** Starts continuous offline recognition. Callbacks arrive on the main thread. */
-    fun start(onPartial: (String) -> Unit, onFinal: (String) -> Unit, onFail: (String) -> Unit): Boolean {
+    /**
+     * Starts continuous offline recognition on our own microphone loop.
+     * Callbacks arrive on the main thread. [onClap] fires on a double clap.
+     */
+    @SuppressLint("MissingPermission")
+    fun start(
+        onPartial: (String) -> Unit,
+        onFinal: (String) -> Unit,
+        onFail: (String) -> Unit,
+        onClap: (() -> Unit)? = null,
+        grammar: String? = null
+    ): Boolean {
         stop()
         val m = model ?: return false
-        return try {
-            // In standby, limit the recogniser to the wake words: far fewer misses than open dictation.
-            val wakeOnly = AppState.core.value == CoreState.STANDBY
-            val rec = if (wakeOnly) {
+        val id = ++runId
+        // A grammar limits the recogniser to the wake words: far fewer misses than open dictation.
+        val rec = try {
+            if (grammar != null) {
                 try {
-                    Recognizer(m, 16000.0f, WakeWord.grammar(Prefs(AurelisApp.instance)))
+                    Recognizer(m, 16000.0f, grammar)
                 } catch (e: Throwable) {
                     Recognizer(m, 16000.0f)
                 }
             } else {
                 Recognizer(m, 16000.0f)
             }
-            val s = SpeechService(rec, 16000.0f)
-            s.startListening(object : RecognitionListener {
-                override fun onPartialResult(hypothesis: String?) {
-                    val t = parse(hypothesis, "partial")
-                    if (t.isNotEmpty()) onPartial(t)
-                }
-
-                override fun onResult(hypothesis: String?) {
-                    onFinal(parse(hypothesis, "text"))
-                }
-
-                override fun onFinalResult(hypothesis: String?) {
-                    onFinal(parse(hypothesis, "text"))
-                }
-
-                override fun onError(exception: Exception?) {
-                    onFail(exception?.message ?: "Microphone error")
-                }
-
-                override fun onTimeout() {}
-            })
-            service = s
-            true
         } catch (e: Throwable) {
             onFail(e.message ?: "Could not start offline listening")
-            false
+            return false
         }
+        val audio = try {
+            val min = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION, 16000,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(min, 6400)
+            )
+        } catch (e: Throwable) {
+            rec.close()
+            onFail(e.message ?: "Could not open the microphone")
+            return false
+        }
+        if (audio.state != AudioRecord.STATE_INITIALIZED) {
+            audio.release()
+            rec.close()
+            onFail("The microphone is busy or not allowed")
+            return false
+        }
+        val t = Thread {
+            val buf = ShortArray(800) // 50 ms of audio
+            val claps = ClapDetector()
+            var lastPartial = ""
+            try {
+                audio.startRecording()
+                while (runId == id) {
+                    val got = audio.read(buf, 0, buf.size)
+                    if (got < 0) throw IOException("Microphone stopped")
+                    if (got == 0) continue
+                    if (onClap != null && claps.feed(buf, got)) main.post { if (runId == id) onClap() }
+                    if (rec.acceptWaveForm(buf, got)) {
+                        val text = parse(rec.result, "text")
+                        lastPartial = ""
+                        main.post { if (runId == id) onFinal(text) }
+                    } else {
+                        val part = parse(rec.partialResult, "partial")
+                        if (part.isNotEmpty() && part != lastPartial) {
+                            lastPartial = part
+                            main.post { if (runId == id) onPartial(part) }
+                        }
+                    }
+                }
+            } catch (e: Throwable) {
+                main.post { if (runId == id) onFail(e.message ?: "Microphone error") }
+            } finally {
+                try {
+                    audio.stop()
+                } catch (e: Throwable) {
+                }
+                audio.release()
+                rec.close()
+            }
+        }
+        thread = t
+        t.start()
+        return true
     }
 
     fun stop() {
-        val s = service ?: return
-        service = null
+        runId++
+        val t = thread ?: return
+        thread = null
         try {
-            s.stop()
-            s.shutdown()
-        } catch (e: Throwable) {
-            // already stopped
+            t.join(400)
+        } catch (e: InterruptedException) {
         }
     }
 
@@ -363,4 +407,48 @@ object Ears {
         } catch (e: Exception) {
             ""
         }
+}
+
+/**
+ * Hears a double clap: two very short, very loud bursts 0.15 to 0.8 seconds apart.
+ * Speech is ignored because its loud stretches last much longer than a clap.
+ */
+class ClapDetector {
+    private var frame = 0L          // 10 ms frames seen so far
+    private var runLength = 0       // consecutive loud frames
+    private var runPeak = 0
+    private var lastClapFrame = -1000L
+
+    fun feed(buf: ShortArray, len: Int): Boolean {
+        var fired = false
+        var i = 0
+        while (i + 160 <= len) {
+            var peak = 0
+            for (j in i until i + 160) {
+                val v = buf[j].toInt()
+                val a = if (v < 0) -v else v
+                if (a > peak) peak = a
+            }
+            frame++
+            if (peak > 9000) {
+                runLength++
+                if (peak > runPeak) runPeak = peak
+            } else if (runLength > 0) {
+                // a loud burst just ended: short and sharp means a clap
+                if (runLength <= 12 && runPeak > 14000) {
+                    val gap = frame - lastClapFrame
+                    if (gap in 15L..80L) {
+                        fired = true
+                        lastClapFrame = -1000L
+                    } else {
+                        lastClapFrame = frame
+                    }
+                }
+                runLength = 0
+                runPeak = 0
+            }
+            i += 160
+        }
+        return fired
+    }
 }
