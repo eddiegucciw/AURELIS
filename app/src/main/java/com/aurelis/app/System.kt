@@ -125,12 +125,37 @@ class NotificationReader : NotificationListenerService() {
 
         fun latest(): List<String> = synchronized(recent) { recent.toList() }
 
+        /** The running listener, while Android has it connected. */
+        @Volatile
+        var instance: NotificationReader? = null
+            private set
+
+        /** Clears every notification that can be cleared. Returns false without notification access. */
+        fun clearAll(): Boolean {
+            val me = instance ?: return false
+            return try {
+                me.cancelAllNotifications()
+                synchronized(recent) { recent.clear() }
+                true
+            } catch (e: Exception) {
+                false
+            }
+        }
+
         fun summary(ctx: Context): String {
             if (!enabled(ctx)) return "I don't have notification access yet. You can enable it in Settings, under Permissions."
             val list = latest()
             if (list.isEmpty()) return "You have no new notifications."
             return "Your latest notifications: " + list.take(5).joinToString(". ") + "."
         }
+    }
+
+    override fun onListenerConnected() {
+        instance = this
+    }
+
+    override fun onListenerDisconnected() {
+        instance = null
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
