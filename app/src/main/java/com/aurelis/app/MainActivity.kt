@@ -46,6 +46,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -255,7 +256,7 @@ fun AiCore(state: CoreState, online: Boolean, modifier: Modifier = Modifier, onT
         0f, 1f, infiniteRepeatable(tween(480, easing = FastOutSlowInEasing), RepeatMode.Reverse), label = "beat"
     )
     val phase by tr.animateFloat(0f, (2 * PI).toFloat(), infiniteRepeatable(tween(1000, easing = LinearEasing)), label = "wave")
-    // The AURELIS artwork, if one was added to the project. It sits in the middle of the animated rings.
+    // The AURELIS artwork, if one was added to the project. When it is there, it becomes the core itself.
     val ctx = LocalContext.current
     val artId = remember { ctx.resources.getIdentifier("aurelis_art", "drawable", ctx.packageName) }
 
@@ -276,6 +277,11 @@ fun AiCore(state: CoreState, online: Boolean, modifier: Modifier = Modifier, onT
         CoreState.OFFLINE -> 0.3f
         CoreState.IDLE -> 0.35f + 0.2f * breath
     }) * (if (dim) 0.6f else 1f)
+
+    if (artId != 0) {
+        ArtCore(artId, state, glow, intensity, dim, slow, fast, breath, beat, phase, modifier, onTap)
+        return
+    }
 
     Box(
         modifier.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onTap() },
@@ -399,17 +405,103 @@ fun AiCore(state: CoreState, online: Boolean, modifier: Modifier = Modifier, onT
                 drawPath(path, Pal.Cyan, style = Stroke(2.5.dp.toPx(), cap = StrokeCap.Round))
             }
         }
-        if (artId != 0) {
-            Box(Modifier.aspectRatio(1f), contentAlignment = Alignment.Center) {
-                Image(
-                    painterResource(artId), contentDescription = "AURELIS",
-                    modifier = Modifier.fillMaxSize(0.72f).clip(CircleShape),
-                    contentScale = ContentScale.Crop,
-                    alpha = if (dim) 0.75f else 1f
-                )
+        Text("A", color = Pal.Silver.copy(alpha = if (dim) 0.6f else 1f), fontSize = 64.sp, fontWeight = FontWeight.ExtraLight)
+    }
+}
+
+/**
+ * The Home core when the AURELIS artwork is installed: the picture itself is the core, shown whole,
+ * and the animation lives around it and on its own rings, so nothing is drawn over the logo.
+ */
+@Composable
+private fun ArtCore(
+    artId: Int, state: CoreState, glow: Color, intensity: Float, dim: Boolean,
+    slow: Float, fast: Float, breath: Float, beat: Float, phase: Float,
+    modifier: Modifier, onTap: () -> Unit
+) {
+    val scale = when (state) {
+        CoreState.SPEAKING -> 1f + 0.025f * beat
+        CoreState.WAKE -> 1.03f
+        CoreState.LISTENING -> 1.01f + 0.01f * breath
+        else -> 1f + 0.012f * breath
+    }
+    Box(
+        modifier.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onTap() },
+        contentAlignment = Alignment.Center
+    ) {
+        // Behind the picture: a soft glow in the colour of what AURELIS is doing.
+        Canvas(Modifier.aspectRatio(1f)) {
+            val c = center
+            val r = size.minDimension * 0.40f
+            drawCircle(
+                brush = Brush.radialGradient(
+                    listOf(
+                        glow.copy(alpha = 0.55f * intensity), glow.copy(alpha = 0.18f * intensity), Color.Transparent
+                    ),
+                    center = c, radius = r * 1.32f
+                ),
+                radius = r * 1.32f, center = c
+            )
+            // Thin orbit that shows the state, outside the picture.
+            drawArc(
+                glow.copy(alpha = (0.3f + 0.6f * intensity).coerceIn(0f, 1f)),
+                if (state == CoreState.THINKING) fast else slow * 2f,
+                if (state == CoreState.THINKING) 120f else if (state == CoreState.LISTENING || state == CoreState.SPEAKING) 360f else 200f,
+                false,
+                topLeft = Offset(c.x - r * 1.12f, c.y - r * 1.12f), size = Size(r * 2.24f, r * 2.24f),
+                style = Stroke(2.5.dp.toPx(), cap = StrokeCap.Round)
+            )
+            val oa = Math.toRadians((slow * 2f).toDouble())
+            drawCircle(
+                Pal.Amber.copy(alpha = if (dim) 0.5f else 1f), 3.5.dp.toPx(),
+                Offset(c.x + (cos(oa) * r * 1.12f).toFloat(), c.y + (sin(oa) * r * 1.12f).toFloat())
+            )
+            if (state == CoreState.SPEAKING) {
+                drawCircle(Pal.Amber.copy(alpha = 0.5f * (1f - beat)), r * (1.02f + 0.2f * beat), c, style = Stroke(2.dp.toPx()))
+                drawCircle(Pal.Cyan.copy(alpha = 0.45f * beat), r * (1.05f + 0.12f * (1f - beat)), c, style = Stroke(2.dp.toPx()))
             }
-        } else {
-            Text("A", color = Pal.Silver.copy(alpha = if (dim) 0.6f else 1f), fontSize = 64.sp, fontWeight = FontWeight.ExtraLight)
+            if (state == CoreState.WAKE) {
+                drawCircle(Pal.Cyan.copy(alpha = 0.85f), r * (1.04f + 0.06f * beat), c, style = Stroke(4.dp.toPx()))
+            }
+        }
+        // The picture, whole and sharp.
+        Image(
+            painterResource(artId), contentDescription = "AURELIS",
+            modifier = Modifier
+                .fillMaxSize(0.80f)
+                .aspectRatio(1f)
+                .graphicsLayer { scaleX = scale; scaleY = scale }
+                .clip(CircleShape),
+            contentScale = ContentScale.Fit,
+            alpha = if (dim) 0.7f else 1f
+        )
+        // On top, only light: the microphone glows while listening, the inner ring spins while thinking.
+        Canvas(
+            Modifier
+                .aspectRatio(1f)
+                .graphicsLayer { scaleX = scale; scaleY = scale }
+        ) {
+            val c = center
+            val r = size.minDimension * 0.40f
+            when (state) {
+                CoreState.LISTENING -> {
+                    val mic = Offset(c.x, c.y + r * 0.5f)
+                    val pulse = 0.5f + 0.5f * sin(phase).toFloat()
+                    drawCircle(Pal.Cyan.copy(alpha = 0.35f + 0.4f * pulse), r * (0.2f + 0.05f * pulse), mic, style = Stroke(3.dp.toPx()))
+                    drawCircle(Pal.Cyan.copy(alpha = 0.25f * (1f - pulse)), r * (0.26f + 0.08f * pulse), mic, style = Stroke(2.dp.toPx()))
+                }
+                CoreState.THINKING -> {
+                    val ir = r * 0.66f
+                    for (i in 0 until 3) {
+                        drawArc(
+                            Pal.Cyan.copy(alpha = 0.8f), fast + i * 120f, 50f, false,
+                            topLeft = Offset(c.x - ir, c.y - ir), size = Size(ir * 2, ir * 2),
+                            style = Stroke(3.dp.toPx(), cap = StrokeCap.Round)
+                        )
+                    }
+                }
+                else -> {}
+            }
         }
     }
 }
