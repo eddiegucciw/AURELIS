@@ -410,15 +410,21 @@ object Ears {
 }
 
 /**
- * Hears a double clap: two very short, very loud bursts 0.15 to 0.8 seconds apart.
+ * Hears a double clap: two very short, sharp bursts 0.12 to 1 second apart.
  * Speech is ignored because its loud stretches last much longer than a clap.
  */
 class ClapDetector {
     private var frame = 0L          // 10 ms frames seen so far
+    private var floor = 600.0       // running estimate of the room's background loudness
     private var runLength = 0       // consecutive loud frames
     private var runPeak = 0
+    private var before = 0          // loudness just before the burst started
     private var lastClapFrame = -1000L
 
+    /**
+     * Listens for two sharp claps about 0.15 to 1 second apart. The thresholds follow the room's
+     * background level, so it works in a quiet bedroom and in a noisy sitting room.
+     */
     fun feed(buf: ShortArray, len: Int): Boolean {
         var fired = false
         var i = 0
@@ -430,22 +436,32 @@ class ClapDetector {
                 if (a > peak) peak = a
             }
             frame++
-            if (peak > 9000) {
+            val loud = maxOf(1800.0, floor * 3.5)
+            if (peak > loud) {
+                if (runLength == 0) before = floor.toInt()
                 runLength++
                 if (peak > runPeak) runPeak = peak
-            } else if (runLength > 0) {
-                // a loud burst just ended: short and sharp means a clap
-                if (runLength <= 12 && runPeak > 14000) {
-                    val gap = frame - lastClapFrame
-                    if (gap in 15L..80L) {
-                        fired = true
-                        lastClapFrame = -1000L
-                    } else {
-                        lastClapFrame = frame
-                    }
+                if (runLength > 25) {
+                    // a long noise (speech, music, a door): not a clap
+                    lastClapFrame = -1000L
                 }
-                runLength = 0
-                runPeak = 0
+            } else {
+                // slowly follow the background, faster when it gets quieter
+                floor = if (peak < floor) floor * 0.9 + peak * 0.1 else floor * 0.995 + peak * 0.005
+                if (runLength > 0) {
+                    val sharp = runLength <= 7 && runPeak > maxOf(3500.0, before * 6.0)
+                    if (sharp) {
+                        val gap = frame - lastClapFrame
+                        if (gap in 12L..100L) {
+                            fired = true
+                            lastClapFrame = -1000L
+                        } else {
+                            lastClapFrame = frame
+                        }
+                    }
+                    runLength = 0
+                    runPeak = 0
+                }
             }
             i += 160
         }
